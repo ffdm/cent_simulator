@@ -36,7 +36,7 @@ class PIM():
     """
     TransformerBlock Class inherits computate functionality from PIM class
     """
-    def __init__(self, args):
+    def __init__(self, args): 
         self.DRAM_column = args.DRAM_column
         self.DRAM_row = args.DRAM_row
         self.burst_length = args.burst_length
@@ -120,8 +120,7 @@ class PIM():
     def store_to_DRAM_single_bank(self, dimm_index, channel_index, bank_index, row_index, col_index, size, data, op_trace):
         # GDDR6 stores with 32B granularity
         if op_trace and dimm_index == 0:
-            for i in range((size - 1) // self.burst_length + 1):
-                self.file.write("W MEM {} {} {}\n".format(channel_index, bank_index, row_index))
+            W_MEM_only_trace(channel_index, bank_index, row_index, size):
         self.pim_device["dimm_" + str(dimm_index)].dimm["channel_" + str(channel_index)].channel["bank_" + str(bank_index)].arrays[row_index][col_index : col_index + size] = data
     
     def store_to_DRAM_all_banks(self, dim_iter, channel, row_current_head, seq, head, xv_data, num_rows_per_seq, rows_per_dim):
@@ -133,8 +132,7 @@ class PIM():
     
     def load_from_DRAM_single_bank(self, dimm_index, channel_index, bank_index, row_index, col_index, size, op_trace):
         if op_trace and dimm_index == 0:
-            for i in range((size - 1) // self.burst_length + 1):
-                self.file.write("R MEM {} {} {}\n".format(channel_index, bank_index, row_index))
+            R_MEM_only_trace(channel_index, bank_index, row_index, size)
         return self.pim_device["dimm_" + str(dimm_index)].dimm["channel_" + str(channel_index)].channel["bank_" + str(bank_index)].arrays[row_index][col_index : col_index + size]
 
     def WR_BIAS(self, dimm, channel, utilized_channels, latch_index, bias, op_trace):
@@ -250,10 +248,12 @@ class PIM():
         return result
     
     def W_MEM_only_trace(self, channel_index, bank_index, row_index, size):
+        return # TODO: MAKE THIS A DEBUGGING FLAG
         for i in range((size - 1) // self.burst_length + 1):
             self.file.write("W MEM {} {} {}\n".format(channel_index, bank_index, row_index))
     
     def R_MEM_only_trace(self, channel_index, bank_index, row_index, size):
+        return # TODO: MAKE THIS A DEBUGGING FLAG
         for i in range((size - 1) // self.burst_length + 1):
             self.file.write("R MEM {} {} {}\n".format(channel_index, bank_index, row_index))
     
