@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
+import sys # FINNPORT
 from aim_sim import PIM
 from TransformerBlock import TransformerBlock
 from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
@@ -86,9 +87,21 @@ class TransformerBlockLlama(TransformerBlock):
             op_size = (self.dic_shape["x_neighbor_bank"][0] - 1) // self.burst_length + 1
             for channel in channel_lst:
                 op_trace = channel == 0 and self.trace_norm
-                self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace)
-                self.MAC_BK_BK(0, channel, channels_required, self.x_row_index, 0, 0, op_size, op_trace)
-                mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace)
+                self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace) # Resets accumulator latches at index 0
+                self.MAC_BK_BK(0, channel, channels_required, self.x_row_index, 0, 0, op_size, op_trace) # Performs the x^2 calculation
+                mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace) # Reads x^2 results into shared buffer
+                # Assume each instruction ACTUALLY writes to the shared buffer (forwarding would be better)
+                # Assume shared buffer register file is dual ported
+                # Assume 16 (256-bit) registers (out of 256 in total SB) from PIM are in SB
+                # ACC OPsize R0 R1
+                # ACC OPsize R2 R3, RED OPsize R0, R0
+                # Vector add
+                # Write back result, 
+                # Read result, 
+                # Vector add each 16-value pair
+                # Reduce them down to one value (can be pipelined w/ above)
+                # Use first register as reduction input register
+                # Finally reduce final 8 values to final sum. 
                 x_pow_sum += sum(mac_lst)    # CXL ports
             compare(x_pow_sum, self.x.pow(2).sum(), "x_pow_sum")
         else:
@@ -96,8 +109,11 @@ class TransformerBlockLlama(TransformerBlock):
             x_copy_load = self.load_from_DRAM_multi_channel(self.x.shape, self.x_row_index, "vector_neighbor_bank_1", self.dic_shape["x_neighbor_bank"][0], False)
             x_pow_sum = self.Vector_Vector_Mul(x_load[0][0], x_copy_load[0][0], False)
 
+
         # CXL Ports     x_copy -> norm_tensor
-        norm = torch.rsqrt(x_pow_sum / self.dim + 1e-5)
+        # Divide by embedding number (RISC-V)
+        # Take inverse sqrt or result (RISC-V)
+        norm = torch.rsqrt(x_pow_sum / self.dim + 1e-5) 
         norm_tensor = torch.full(self.x.shape, norm)
         self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.x_copy_row_index, "vector_bank_group_1", self.trace_norm)
         self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
@@ -135,7 +151,7 @@ class TransformerBlockLlama(TransformerBlock):
         # Broadcast the scattered RMSNorm_x_aim results to all channels
         RMSNorm_x_aim = self.load_from_DRAM_multi_channel(self.x.shape, self.SANorm_row_index, "vector_bank_group_2", self.dic_shape["x_bank_group"][0], self.trace_norm)
         compare(RMSNorm_x_aim[0][0], RMSNorm(self.x[0][0], self.SANorm), "RMSNorm_x_aim")
-        
+
         # AiM MAC BK x GB
         if self.pim_compute:
         # if False:
