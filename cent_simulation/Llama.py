@@ -86,11 +86,15 @@ class TransformerBlockLlama(TransformerBlock):
             x_pow_sum = 0
             op_size = (self.dic_shape["x_neighbor_bank"][0] - 1) // self.burst_length + 1
             for channel in channel_lst:
+                mac_regs[channel] = self.shared_buffer.allocate(op_size)
+            for channel in channel_lst:
                 op_trace = channel == 0 and self.trace_norm
+                mac_regs_ch = mac_regs[channel]
                 self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace) # Resets accumulator latches at index 0
                 self.MAC_BK_BK(0, channel, channels_required, self.x_row_index, 0, 0, op_size, op_trace) # Performs the x^2 calculation
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace) # Reads x^2 results into shared buffer
                 # Assume each instruction ACTUALLY writes to the shared buffer (forwarding would be better)
+                self.shared_buffer.registers[mac_regs_ch] = torch.tensor(mac_lst, dtype=torch.bfloat16)
                 # Assume shared buffer register file is dual ported
                 # Assume 16 (256-bit) registers (out of 256 in total SB) from PIM are in SB
                 # ACC OPsize R0 R1

@@ -33,3 +33,25 @@ class PNM:
         # Write to trace file
         # Format: PNM_RED <MASK> <SRC> <DST> <SIZE>
         self.file.write(f"PNM_RED {channel_mask} {src_row} {dst_row} {size}\n")
+
+class SharedBuffer:
+    def __init__(self, num_registers=256):
+        self.num_registers = num_registers
+        # Model 256-bit registers (each holding 16 elements)
+        self.registers = {i: torch.zeros(16, dtype=torch.bfloat16) for i in range(num_registers)}
+        self.free_regs = list(range(num_registers))
+
+    def allocate(self, count=1):
+        if len(self.free_regs) < count:
+            raise RuntimeError(f"Out of Shared Buffer registers. Requested {count}, available {len(self.free_regs)}")
+        allocated = self.free_regs[:count]
+        self.free_regs = self.free_regs[count:]
+        return allocated
+
+    def free(self, regs):
+        if isinstance(regs, int):
+            regs = [regs]
+        self.free_regs.extend(regs)
+        # Clear data upon free
+        for r in regs:
+            self.registers[r] = torch.zeros(16, dtype=torch.bfloat16)

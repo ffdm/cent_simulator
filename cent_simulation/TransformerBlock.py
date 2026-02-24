@@ -7,7 +7,7 @@ from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
 
 debug = True
 
-class TransformerBlock(PIM):
+class TransformerBlock(PIM, PNM):
     """
     Llama TransformerBlock Class inherits computate functionality from PIM class
     """
@@ -100,6 +100,7 @@ class TransformerBlock(PIM):
         else:
             self.FC_total_banks = self.total_banks
             self.intra_device_attention = True
+        self.shared_buffer = SharedBuffer(256)
 
     def bank_index(self, index):
         # look for the bank to store a head
