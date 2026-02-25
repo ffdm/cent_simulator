@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 from aim_sim import PIM
-from pnm_sim import PNM
+from pnm_sim import PNM, SharedBuffer
 from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
 
 debug = True

@@ -1,4 +1,9 @@
-# cent_simulation/pnm_sim.py
+import torch
+
+# Theoretical RISC-V Firmware PCs
+PC_RMSNORM_SCALE = 0x1000
+PC_SOFTMAX_SCALE = 0x1004
+PC_SOFTMAX_EXP_SUM = 0x1008
 
 class PNM:
     """
@@ -6,33 +11,65 @@ class PNM:
     Designed to be inherited by the TransformerBlockLlama class along with PIM class
     """
     
-    # Define timing constants for your new units if you want to track latency
-    # You might want to initialize this in a separate init or just append to self.timing_constant later
-    
     def PNM_RISCV_only_trace(self, instruction_id, cycles):
         """
         Simulate a RISC-V instruction on the PNM unit.
         """
-        # Update internal stats (assuming self.time was init by PIM class)
-        # You might need to add "PNM_RISCV" to self.time keys in PIM.__init__ or handle it safely here
         if "PNM_RISCV" in self.time:
             self.time["PNM_RISCV"] += cycles
-
-        # Write to the trace file
-        # Format: PNM_RISCV <ID> <CYCLES>
         self.file.write(f"PNM_RISCV {instruction_id} {cycles}\n")
 
     def PNM_RED_only_trace(self, channel_mask, src_row, dst_row, size):
         """
         Simulate a Reduction operation (e.g., Sum) in the PNM unit.
         """
-        # Update stats
         if "PNM_RED" in self.time:
-             self.time["PNM_RED"] += 1 # or some latency calculation
-
-        # Write to trace file
-        # Format: PNM_RED <MASK> <SRC> <DST> <SIZE>
+             self.time["PNM_RED"] += 1 
         self.file.write(f"PNM_RED {channel_mask} {src_row} {dst_row} {size}\n")
+
+    def RED(self, opsize, rd, rs):
+        if not self.only_trace:
+            if isinstance(rs, list):
+                total_sum = sum(self.shared_buffer.registers[r].sum() for r in rs)
+            else:
+                total_sum = self.shared_buffer.registers[rs].sum()
+            
+            rd_reg = rd[0] if isinstance(rd, list) else rd
+            # Store in the first element
+            self.shared_buffer.registers[rd_reg][0] = total_sum
+            
+            # TODO: add trace generation
+
+    def ACC(self, opsize, rd, rs):
+        if not self.only_trace:
+            if isinstance(rs, list) and isinstance(rd, list):
+                for i in range(opsize):
+                    self.shared_buffer.registers[rd[i]] += self.shared_buffer.registers[rs[i]]
+            else:
+                self.shared_buffer.registers[rd] += self.shared_buffer.registers[rs]
+            
+            # TODO: add trace generation
+
+    def EXP(self, opsize, rd, rs):
+        if not self.only_trace:
+            if isinstance(rs, list) and isinstance(rd, list):
+                for i in range(opsize):
+                    self.shared_buffer.registers[rd[i]] = torch.exp(self.shared_buffer.registers[rs[i]])
+            else:
+                self.shared_buffer.registers[rd] = torch.exp(self.shared_buffer.registers[rs])
+            
+            # TODO: add trace generation
+
+    def RISCV(self, opsize, pc, rd, rs):
+        if not self.only_trace:
+            rs_reg = rs[0] if isinstance(rs, list) else rs
+            rd_reg = rd[0] if isinstance(rd, list) else rd
+            
+            if pc == PC_RMSNORM_SCALE:
+                input_data = self.shared_buffer.registers[rs_reg][0]
+                norm = torch.rsqrt(input_data / self.dim + 1e-5)
+                # Broadcast the scalar norm to all elements
+                self.shared_buffer.registers[rd_reg] = torch.full((16,), norm.item(), dtype=torch.bfloat16)
 
 class SharedBuffer:
     def __init__(self, num_registers=256):

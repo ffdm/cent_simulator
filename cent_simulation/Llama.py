@@ -85,6 +85,7 @@ class TransformerBlockLlama(TransformerBlock):
         if self.pim_compute:
             x_pow_sum = 0
             op_size = (self.dic_shape["x_neighbor_bank"][0] - 1) // self.burst_length + 1
+            mac_regs = {}
             for channel in channel_lst:
                 mac_regs[channel] = self.shared_buffer.allocate(op_size)
             for channel in channel_lst:
@@ -92,34 +93,42 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_regs_ch = mac_regs[channel]
                 self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace) # Resets accumulator latches at index 0
                 self.MAC_BK_BK(0, channel, channels_required, self.x_row_index, 0, 0, op_size, op_trace) # Performs the x^2 calculation
-                mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace) # Reads x^2 results into shared buffer
-                # Assume each instruction ACTUALLY writes to the shared buffer (forwarding would be better)
-                self.shared_buffer.registers[mac_regs_ch] = torch.tensor(mac_lst, dtype=torch.bfloat16)
-                # Assume shared buffer register file is dual ported
-                # Assume 16 (256-bit) registers (out of 256 in total SB) from PIM are in SB
-                # ACC OPsize R0 R1
-                # ACC OPsize R2 R3, RED OPsize R0, R0
-                # Vector add
-                # Write back result, 
-                # Read result, 
-                # Vector add each 16-value pair
-                # Reduce them down to one value (can be pipelined w/ above)
-                # Use first register as reduction input register
-                # Finally reduce final 8 values to final sum. 
-                x_pow_sum += sum(mac_lst)    # CXL ports
-            compare(x_pow_sum, self.x.pow(2).sum(), "x_pow_sum")
+                mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads x^2 results into shared buffer
+                
+                # Perform reduction on PNM
+                reduced_reg = self.shared_buffer.allocate(1)
+                self.RED(opsize=1, rd=reduced_reg, rs=mac_regs_ch)
+                x_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
+                self.shared_buffer.free(reduced_reg)
+                self.shared_buffer.free(mac_regs_ch)
+
+            compare(torch.tensor(x_pow_sum, dtype=torch.bfloat16), self.x.pow(2).sum().to(torch.bfloat16), "x_pow_sum")
+            
+            # Use RISCV for div and rsqrt
+            input_reg = self.shared_buffer.allocate(1)
+            output_reg = self.shared_buffer.allocate(1)
+            self.shared_buffer.registers[input_reg[0]][0] = x_pow_sum
+            self.RISCV(1, 0x1000, output_reg, input_reg)
+            norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item() # scalar value
+            norm_tensor = torch.full(self.x.shape, norm_tensor_item)
+            self.shared_buffer.free(input_reg)
+            self.shared_buffer.free(output_reg)
+            
+            self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.x_copy_row_index, "vector_bank_group_1", self.trace_norm)
+            
         else:
             x_load = self.load_from_DRAM_multi_channel(self.x.shape, self.x_row_index, "vector_neighbor_bank_0", self.dic_shape["x_neighbor_bank"][0], False)
             x_copy_load = self.load_from_DRAM_multi_channel(self.x.shape, self.x_row_index, "vector_neighbor_bank_1", self.dic_shape["x_neighbor_bank"][0], False)
             x_pow_sum = self.Vector_Vector_Mul(x_load[0][0], x_copy_load[0][0], False)
 
 
-        # CXL Ports     x_copy -> norm_tensor
-        # Divide by embedding number (RISC-V)
-        # Take inverse sqrt or result (RISC-V)
-        norm = torch.rsqrt(x_pow_sum / self.dim + 1e-5) 
-        norm_tensor = torch.full(self.x.shape, norm)
-        self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.x_copy_row_index, "vector_bank_group_1", self.trace_norm)
+            # CXL Ports     x_copy -> norm_tensor
+            # Divide by embedding number (RISC-V)
+            # Take inverse sqrt of result (RISC-V)
+            norm = torch.rsqrt(x_pow_sum / self.dim + 1e-5) 
+            norm_tensor = torch.full(self.x.shape, norm)
+            self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.x_copy_row_index, "vector_bank_group_1", self.trace_norm)
+            
         self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
         
         # AiM EWMUL     Load x and norm_tensor      norm_tensor -> norm_x -> RMSNorm_x_aim

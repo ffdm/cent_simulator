@@ -120,7 +120,7 @@ class PIM():
     def store_to_DRAM_single_bank(self, dimm_index, channel_index, bank_index, row_index, col_index, size, data, op_trace):
         # GDDR6 stores with 32B granularity
         if op_trace and dimm_index == 0:
-            W_MEM_only_trace(channel_index, bank_index, row_index, size):
+            self.W_MEM_only_trace(channel_index, bank_index, row_index, size)
         self.pim_device["dimm_" + str(dimm_index)].dimm["channel_" + str(channel_index)].channel["bank_" + str(bank_index)].arrays[row_index][col_index : col_index + size] = data
     
     def store_to_DRAM_all_banks(self, dim_iter, channel, row_current_head, seq, head, xv_data, num_rows_per_seq, rows_per_dim):
@@ -132,7 +132,7 @@ class PIM():
     
     def load_from_DRAM_single_bank(self, dimm_index, channel_index, bank_index, row_index, col_index, size, op_trace):
         if op_trace and dimm_index == 0:
-            R_MEM_only_trace(channel_index, bank_index, row_index, size)
+            self.R_MEM_only_trace(channel_index, bank_index, row_index, size)
         return self.pim_device["dimm_" + str(dimm_index)].dimm["channel_" + str(channel_index)].channel["bank_" + str(bank_index)].arrays[row_index][col_index : col_index + size]
 
     def WR_BIAS(self, dimm, channel, utilized_channels, latch_index, bias, op_trace):
@@ -169,7 +169,7 @@ class PIM():
                 B = self.load_from_DRAM_single_bank(dimm, channel, bank*2+1, row_index, col_index + i * self.burst_length, self.burst_length, False)
                 self.pim_device["dimm_" + str(dimm)].dimm["channel_" + str(channel)].channel["bank_" + str(bank*2)].latch[latch_index] += self.MAC(A, B, False)
     
-    def RD_MAC(self, dimm, channel, utilized_channels, latch_index, op_trace):
+    def RD_MAC(self, dimm, channel, utilized_channels, latch_index, op_trace, dest_regs=None):
         self.time["RD_MAC"] += self.timing_constant["RD_MAC"]
         result = []
         if op_trace and dimm == 0:
@@ -178,6 +178,11 @@ class PIM():
             self.file.write("AiM RD_MAC 0 {}\n".format(self.hex_channel_mask(channel_lst)))
         for bank in range(self.num_banks):
             result.append(self.pim_device["dimm_" + str(dimm)].dimm["channel_" + str(channel)].channel["bank_" + str(bank)].latch[latch_index])
+        
+        if not self.only_trace and hasattr(self, 'shared_buffer') and dest_regs is not None:
+            dest_reg = dest_regs[0] if isinstance(dest_regs, list) else dest_regs
+            self.shared_buffer.registers[dest_reg] = torch.tensor(result, dtype=torch.bfloat16)
+            
         return result
     
     def EWMUL(self, dimm, channel, utilized_channels, row_index, col_index, op_size, op_trace):
