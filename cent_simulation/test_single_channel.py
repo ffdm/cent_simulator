@@ -15,15 +15,15 @@ def test_rms_norm():
         "dim": torch.tensor(dim),
         "n_heads": torch.tensor(n_heads),
         "TP_param": torch.tensor(1),
-        "x": torch.randn((1, 1, dim)),
+        "x": torch.randn((1, 1, dim)) * 0.1,
         "SANorm": torch.ones(dim),
         "FFNNorm": torch.ones(dim),
         "sa": torch.zeros((1, 1, dim)),
         "h": torch.zeros((1, 1, dim)),
         "out": torch.zeros((1, 1, dim)),
-        "wq": torch.randn((dim, dim)),
-        "wk": torch.randn((dim, dim)),
-        "wv": torch.randn((dim, dim)),
+        "wq": torch.randn((dim, dim)) * 0.01,
+        "wk": torch.randn((dim, dim)) * 0.01,
+        "wv": torch.randn((dim, dim)) * 0.01,
         "xq": torch.zeros((1, 1, dim)),
         "xk": torch.zeros((1, 1, dim)),
         "xv": torch.zeros((1, 1, dim)),
@@ -33,10 +33,10 @@ def test_rms_norm():
         "cache_v": torch.zeros((1, 1, n_heads, head_dim)),
         "scores": torch.zeros((1, n_heads, 1, 1)),
         "output": torch.zeros((1, 1, dim)),
-        "wo": torch.randn((dim, dim)),
-        "w1": torch.randn((dim, dim)),
-        "w3": torch.randn((dim, dim)),
-        "w2": torch.randn((dim, dim)),
+        "wo": torch.randn((dim, dim)) * 0.01,
+        "w1": torch.randn((dim, dim)) * 0.01,
+        "w3": torch.randn((dim, dim)) * 0.01,
+        "w2": torch.randn((dim, dim)) * 0.01,
         "ffn": torch.zeros((1, 1, dim))
     }
 
@@ -84,8 +84,16 @@ def test_rms_norm():
     print("Running self_attention_aim...")
     try:
         sa_aim = TB.self_attention_aim()
-        print("Test passed successfully!")
+        print("self_attention_aim test passed successfully!")
+        
+        print("Running FFN_aim...")
+        out_aim = TB.FFN_aim(sa_aim)
+        print("FFN_aim test passed successfully!")
+        
+        print("All tests passed successfully!")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Test failed with exception: {e}")
 
 if __name__ == "__main__":

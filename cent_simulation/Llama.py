@@ -461,12 +461,38 @@ class TransformerBlockLlama(TransformerBlock):
             self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
             self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
             sa_pow_sum = 0
+            op_size = (self.dic_shape["sa_neighbor_bank"][0] - 1) // self.burst_length + 1
+            mac_regs = {}
+            for channel in channel_lst:
+                mac_regs[channel] = self.shared_buffer.allocate(op_size)
             for channel in channel_lst:
                 op_trace = channel == 0 and self.trace_norm
-                self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace)
-                op_size = (self.dic_shape["sa_neighbor_bank"][0] - 1) // self.burst_length + 1
-                self.MAC_BK_BK(0, channel, channels_required, self.sa_copy_row_index, 0, 0, op_size, op_trace)
-                sa_pow_sum += sum(self.RD_MAC(0, channel, channels_required, 0, op_trace))    # CXL ports
+                mac_regs_ch = mac_regs[channel]
+                self.WR_BIAS(0, channel, channels_required, 0, [0 for bank in range(self.num_banks)], op_trace) # Resets accumulator latches at index 0
+                self.MAC_BK_BK(0, channel, channels_required, self.sa_copy_row_index, 0, 0, op_size, op_trace) # Performs the sa^2 calculation
+                mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads sa^2 results into shared buffer
+                
+                # Perform reduction on PNM
+                reduced_reg = self.shared_buffer.allocate(1)
+                self.RED(opsize=1, rd=reduced_reg, rs=mac_regs_ch)
+                sa_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
+                self.shared_buffer.free(reduced_reg)
+                self.shared_buffer.free(mac_regs_ch)
+
+            compare(torch.tensor(sa_pow_sum, dtype=torch.bfloat16), sa_aim.pow(2).sum().to(torch.bfloat16), "sa_pow_sum")
+
+            # Use RISCV for div and rsqrt
+            input_reg = self.shared_buffer.allocate(1)
+            output_reg = self.shared_buffer.allocate(1)
+            self.shared_buffer.registers[input_reg[0]][0] = sa_pow_sum
+            self.RISCV(1, 0x1000, output_reg, input_reg)
+            norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item()
+            norm_tensor = torch.full(sa_aim.shape, norm_tensor_item)
+            self.shared_buffer.free(input_reg)
+            self.shared_buffer.free(output_reg)
+
+            self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.sa_copy_row_index, "vector_bank_group_1", self.trace_norm)
+
         else:
             self.dic_shape["sa_bank_group"] = self.store_to_DRAM_multi_channel(sa_aim[0][0], self.sa_copy_row_index, "vector_bank_group_0", False)
             self.store_to_DRAM_multi_channel(sa_aim[0][0], self.sa_copy_row_index, "vector_bank_group_1", False)
@@ -474,11 +500,12 @@ class TransformerBlockLlama(TransformerBlock):
             sa_copy_load = self.load_from_DRAM_multi_channel(self.sa.shape, self.sa_copy_row_index, "vector_bank_group_1", self.dic_shape["sa_bank_group"][0], False)
             sa_pow_sum = self.Vector_Vector_Mul(sa_load[0][0], sa_copy_load[0][0], False)
 
-        # CXL Ports
-        compare(sa_pow_sum, sa_aim.pow(2).sum(), "sa pow")
-        norm = torch.rsqrt(sa_pow_sum / self.dim + 1e-5)
-        norm_tensor = torch.full(sa_aim.shape, norm)
-        self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.sa_copy_row_index, "vector_bank_group_1", self.trace_norm)
+            # CXL Ports
+            compare(sa_pow_sum, sa_aim.pow(2).sum(), "sa pow")
+            norm = torch.rsqrt(sa_pow_sum / self.dim + 1e-5)
+            norm_tensor = torch.full(sa_aim.shape, norm)
+            self.store_to_DRAM_multi_channel(norm_tensor[0][0], self.sa_copy_row_index, "vector_bank_group_1", self.trace_norm)
+            
         self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
 
         # AiM EWMUL
