@@ -96,8 +96,12 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads x^2 results into shared buffer
                 
                 # Perform reduction on PNM
+                accum_reg = self.shared_buffer.allocate(1)
+                for reg in mac_regs_ch:
+                    self.ACC(opsize=1, rd=accum_reg[0], rs=reg)
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=1, rd=reduced_reg, rs=mac_regs_ch)
+                self.RED(opsize=1, rd=reduced_reg[0], rs=accum_reg[0])
+                self.shared_buffer.free(accum_reg)
                 x_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
@@ -473,8 +477,12 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads sa^2 results into shared buffer
                 
                 # Perform reduction on PNM
+                accum_reg = self.shared_buffer.allocate(1)
+                for reg in mac_regs_ch:
+                    self.ACC(opsize=1, rd=accum_reg[0], rs=reg)
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=1, rd=reduced_reg, rs=mac_regs_ch)
+                self.RED(opsize=1, rd=reduced_reg[0], rs=accum_reg[0])
+                self.shared_buffer.free(accum_reg)
                 sa_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)

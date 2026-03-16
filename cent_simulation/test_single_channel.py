@@ -5,11 +5,13 @@ import argparse
 from Llama import TransformerBlockLlama
 from utils import compare
 
-def test_rms_norm():
-    print("Initializing test...")
+def get_test_inputs():
     dim = 4096
     n_heads = 32
     head_dim = dim // n_heads
+
+    # Set seed for reproducibility across different test environments
+    torch.manual_seed(42)
 
     dic_model = {
         "dim": torch.tensor(dim),
@@ -39,6 +41,14 @@ def test_rms_norm():
         "w2": torch.randn((dim, dim)) * 0.01,
         "ffn": torch.zeros((1, 1, dim))
     }
+    return dic_model
+
+def test_rms_norm():
+    print("Initializing test...")
+    dic_model = get_test_inputs()
+    dim = dic_model["dim"].item()
+    n_heads = dic_model["n_heads"].item()
+    head_dim = dim // n_heads
 
     class DummyArgs:
         pass

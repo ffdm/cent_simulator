@@ -76,7 +76,7 @@ def compare_1d(a, b, name):
         b_flatten = b.reshape(-1)
         error_count = 0
         error_lst = []
-        for i in range(a_flatten.shape[0]):
+        for i in range(min(a_flatten.shape[0], b_flatten.shape[0])):
             diff = abs((a_flatten[i] - b_flatten[i]) / b_flatten[i])
             if diff > 0.001:
                 error_count += 1

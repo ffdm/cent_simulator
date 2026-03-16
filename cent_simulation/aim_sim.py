@@ -150,7 +150,7 @@ class PIM():
         if op_trace and dimm == 0:
             channel_multi_transformer_block_required = self.num_channels // utilized_channels * utilized_channels
             channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
-            self.file.write("AiM MAC_ABK {} {} {} {} {}\n".format(op_size, self.hex_channel_mask(channel_lst), row_index))
+            self.file.write("AiM MAC_ABK {} {} {}\n".format(op_size, self.hex_channel_mask(channel_lst), row_index))
         for bank in range(self.num_banks):
             for i in range(op_size):
                 A = self.load_from_DRAM_single_bank(dimm, channel, bank, row_index, col_index + i * self.burst_length, self.burst_length, False)
@@ -162,7 +162,7 @@ class PIM():
         if op_trace and dimm == 0:
             channel_multi_transformer_block_required = self.num_channels // utilized_channels * utilized_channels
             channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
-            self.file.write("AiM MAC_ABK {} {} {} {} {}\n".format(op_size, self.hex_channel_mask(channel_lst), row_index, col_index))
+            self.file.write("AiM MAC_ABK {} {} {} {}\n".format(op_size, self.hex_channel_mask(channel_lst), row_index, col_index))
         for bank in range(self.num_banks//2):
             for i in range(op_size):
                 A = self.load_from_DRAM_single_bank(dimm, channel, bank*2, row_index, col_index + i * self.burst_length, self.burst_length, False)
