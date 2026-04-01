@@ -1,9 +1,9 @@
 import torch
 
-# Theoretical RISC-V Firmware PCs
-PC_RMSNORM_SCALE = 0x1000
-PC_SOFTMAX_SCALE = 0x1004
-PC_SOFTMAX_EXP_SUM = 0x1008
+# RISC-V Firmware PCs (actual addresses matching linker script)
+PC_RMSNORM_SCALE = 0x80004000
+PC_SOFTMAX_SCALE = 0x80004100
+PC_SOFTMAX_EXP_SUM = 0x80004200
 
 class PNM:
     """
