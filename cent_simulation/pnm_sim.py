@@ -30,14 +30,16 @@ class PNM:
     def RED(self, opsize, rd, rs):
         if not self.only_trace:
             if isinstance(rs, list):
-                total_sum = sum(self.shared_buffer.registers[r].sum() for r in rs)
+                src_regs = rs[:opsize]
             else:
-                total_sum = self.shared_buffer.registers[rs].sum()
-            
+                src_regs = [rs + i for i in range(opsize)]
+
+            total_sum = sum(self.shared_buffer.registers[r].sum() for r in src_regs)
+
             rd_reg = rd[0] if isinstance(rd, list) else rd
-            # Store in the first element
+            self.shared_buffer.registers[rd_reg] = torch.zeros(16, dtype=torch.bfloat16)
             self.shared_buffer.registers[rd_reg][0] = total_sum
-            
+
         if self.op_trace:
             rs_val = rs[0] if isinstance(rs, list) else rs
             rd_val = rd[0] if isinstance(rd, list) else rd
@@ -45,12 +47,17 @@ class PNM:
 
     def ACC(self, opsize, rd, rs):
         if not self.only_trace:
-            if isinstance(rs, list) and isinstance(rd, list):
-                for i in range(opsize):
-                    self.shared_buffer.registers[rd[i]] += self.shared_buffer.registers[rs[i]]
+            if isinstance(rs, list):
+                src_regs = rs[:opsize]
             else:
-                self.shared_buffer.registers[rd] += self.shared_buffer.registers[rs]
-            
+                src_regs = [rs + i for i in range(opsize)]
+
+            total_sum = sum(self.shared_buffer.registers[r].sum() for r in src_regs)
+
+            rd_reg = rd[0] if isinstance(rd, list) else rd
+            self.shared_buffer.registers[rd_reg] = torch.zeros(16, dtype=torch.bfloat16)
+            self.shared_buffer.registers[rd_reg][0] = total_sum
+
         if self.op_trace:
             rs_val = rs[0] if isinstance(rs, list) else rs
             rd_val = rd[0] if isinstance(rd, list) else rd

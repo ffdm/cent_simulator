@@ -95,13 +95,8 @@ class TransformerBlockLlama(TransformerBlock):
                 self.MAC_BK_BK(0, channel, channels_required, self.x_row_index, 0, 0, op_size, op_trace) # Performs the x^2 calculation
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads x^2 results into shared buffer
                 
-                # Perform reduction on PNM
-                accum_reg = self.shared_buffer.allocate(1)
-                for reg in mac_regs_ch:
-                    self.ACC(opsize=1, rd=accum_reg[0], rs=reg)
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=1, rd=reduced_reg[0], rs=accum_reg[0])
-                self.shared_buffer.free(accum_reg)
+                self.ACC(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
                 x_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
@@ -476,13 +471,8 @@ class TransformerBlockLlama(TransformerBlock):
                 self.MAC_BK_BK(0, channel, channels_required, self.sa_copy_row_index, 0, 0, op_size, op_trace) # Performs the sa^2 calculation
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads sa^2 results into shared buffer
                 
-                # Perform reduction on PNM
-                accum_reg = self.shared_buffer.allocate(1)
-                for reg in mac_regs_ch:
-                    self.ACC(opsize=1, rd=accum_reg[0], rs=reg)
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=1, rd=reduced_reg[0], rs=accum_reg[0])
-                self.shared_buffer.free(accum_reg)
+                self.ACC(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
                 sa_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
