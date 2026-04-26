@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import sys # FINNPORT
 from aim_sim import PIM
+from pnm_sim import PC_RMSNORM_SCALE
 from TransformerBlock import TransformerBlock
 from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
 
@@ -96,7 +97,7 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads x^2 results into shared buffer
                 
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.ACC(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
+                self.RED(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
                 x_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
@@ -107,7 +108,7 @@ class TransformerBlockLlama(TransformerBlock):
             input_reg = self.shared_buffer.allocate(1)
             output_reg = self.shared_buffer.allocate(1)
             self.shared_buffer.registers[input_reg[0]][0] = x_pow_sum
-            self.RISCV(1, 0x1000, output_reg, input_reg)
+            self.RISCV(1, PC_RMSNORM_SCALE, output_reg, input_reg)
             norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item() # scalar value
             norm_tensor = torch.full(self.x.shape, norm_tensor_item)
             self.shared_buffer.free(input_reg)
@@ -472,7 +473,7 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads sa^2 results into shared buffer
                 
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.ACC(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
+                self.RED(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
                 sa_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
                 self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
@@ -483,7 +484,7 @@ class TransformerBlockLlama(TransformerBlock):
             input_reg = self.shared_buffer.allocate(1)
             output_reg = self.shared_buffer.allocate(1)
             self.shared_buffer.registers[input_reg[0]][0] = sa_pow_sum
-            self.RISCV(1, 0x1000, output_reg, input_reg)
+            self.RISCV(1, PC_RMSNORM_SCALE, output_reg, input_reg)
             norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item()
             norm_tensor = torch.full(sa_aim.shape, norm_tensor_item)
             self.shared_buffer.free(input_reg)

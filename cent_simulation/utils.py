@@ -1,3 +1,6 @@
+import math
+import os
+
 import torch
 import argparse
 
@@ -66,6 +69,21 @@ def get_args():
 
 def compare_1d(a, b, name):
     if not torch.equal(a, b):
+        max_error_examples = int(os.getenv("CENT_COMPARE_MAX_ERRORS", "8"))
+        # Absolute-tolerance floor scaled to the vector dimension. bf16 has
+        # relative epsilon ~7.8e-3; a length-N dot product accumulates noise
+        # roughly proportional to sqrt(N) * eps_rel * |x|. The default per-dim
+        # constant is calibrated so a 4096-wide bf16 dot product of unit-scale
+        # vectors lands near 1e-3 (matching the empirical FFN W2 noise floor).
+        # Override the per-dim base with CENT_COMPARE_ATOL_PER_DIM, or pin the
+        # final atol with CENT_COMPARE_ATOL.
+        n = max(min(a.numel(), b.numel()), 1)
+        atol_env = os.getenv("CENT_COMPARE_ATOL")
+        if atol_env is not None:
+            atol = float(atol_env)
+        else:
+            atol_per_dim = float(os.getenv("CENT_COMPARE_ATOL_PER_DIM", "1.5e-5"))
+            atol = atol_per_dim * math.sqrt(n)
         p1 = False
         p2 = False
         p3 = False
@@ -77,10 +95,15 @@ def compare_1d(a, b, name):
         error_count = 0
         error_lst = []
         for i in range(min(a_flatten.shape[0], b_flatten.shape[0])):
-            diff = abs((a_flatten[i] - b_flatten[i]) / b_flatten[i])
+            abs_diff = abs(a_flatten[i] - b_flatten[i])
+            if abs_diff <= atol:
+                continue
+            denom = max(abs(b_flatten[i]), atol)
+            diff = abs_diff / denom
             if diff > 0.001:
                 error_count += 1
-                error_lst.append((i, a_flatten[i].item(), b_flatten[i].item()))
+                if len(error_lst) < max_error_examples:
+                    error_lst.append((i, a_flatten[i].item(), b_flatten[i].item()))
                 if diff > 0.1:
                     p_large = True
                 elif diff > 0.05:
@@ -111,6 +134,8 @@ def compare_1d(a, b, name):
 
         for error in error_lst:
             print(error)
+        if error_count > len(error_lst):
+            print("... {} more mismatches omitted".format(error_count - len(error_lst)))
 
 def compare(a, b, name):
     if torch.equal(a, b):

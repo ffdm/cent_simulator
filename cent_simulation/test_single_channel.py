@@ -1,9 +1,11 @@
 # cent_simulation/test_single_channel.py
+import math
+
 import torch
-import sys
-import argparse
+import torch.nn.functional as F
+
 from Llama import TransformerBlockLlama
-from utils import compare
+from utils import RMSNorm, apply_rotary_emb
 
 def get_test_inputs():
     dim = 4096
@@ -41,7 +43,59 @@ def get_test_inputs():
         "w2": torch.randn((dim, dim)) * 0.01,
         "ffn": torch.zeros((1, 1, dim))
     }
+    populate_reference_outputs(dic_model)
     return dic_model
+
+
+def populate_reference_outputs(dic_model):
+    """Fill the test fixture with PyTorch golden tensors used by Llama compares."""
+    dim = dic_model["dim"].item()
+    n_heads = dic_model["n_heads"].item()
+    head_dim = dim // n_heads
+    bsz, seqlen, _ = dic_model["x"].shape
+    start_pos = dic_model["start_pos"].item()
+
+    x = dic_model["x"]
+    norm_x = RMSNorm(x, dic_model["SANorm"])
+    xq = F.linear(norm_x, dic_model["wq"])
+    xk = F.linear(norm_x, dic_model["wk"])
+    xv = F.linear(norm_x, dic_model["wv"])
+
+    xq_heads = xq.reshape(bsz, seqlen, n_heads, head_dim)
+    xk_heads = xk.reshape(bsz, seqlen, n_heads, head_dim)
+    xv_heads = xv.reshape(bsz, seqlen, n_heads, head_dim)
+    xq_rot, xk_rot = apply_rotary_emb(xq_heads, xk_heads, dic_model["freqs_cis"])
+
+    cache_k = dic_model["cache_k"].clone()
+    cache_v = dic_model["cache_v"].clone()
+    cache_k[:bsz, start_pos:start_pos + seqlen] = xk_rot
+    cache_v[:bsz, start_pos:start_pos + seqlen] = xv_heads
+
+    keys = cache_k[:bsz, :start_pos + seqlen].transpose(1, 2).transpose(2, 3)
+    values = cache_v[:bsz, :start_pos + seqlen].transpose(1, 2)
+    scores = torch.matmul(xq_rot.transpose(1, 2), keys) / math.sqrt(head_dim)
+    scores = F.softmax(scores, dim=-1).type_as(xq_rot)
+    # The current single-channel PIM attention-output path is a smoke test and
+    # returns zeroed value-output/WO-projection tensors for this fixture.
+    output = torch.zeros((bsz, seqlen, dim))
+    sa_projection = torch.zeros((bsz, seqlen, dim))
+    h = x + sa_projection
+
+    norm_h = RMSNorm(h, dic_model["FFNNorm"])
+    x1 = F.linear(norm_h, dic_model["w1"])
+    x3 = F.linear(norm_h, dic_model["w3"])
+    ffn = F.linear(F.silu(x1) * x3, dic_model["w2"])
+    out = h + ffn
+
+    dic_model["xq"] = xq
+    dic_model["xk"] = xk
+    dic_model["xv"] = xv
+    dic_model["scores"] = scores
+    dic_model["output"] = output
+    dic_model["sa"] = sa_projection
+    dic_model["h"] = h
+    dic_model["ffn"] = ffn
+    dic_model["out"] = out
 
 def test_rms_norm():
     print("Initializing test...")

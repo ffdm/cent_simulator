@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 # RISC-V Firmware PCs (actual addresses matching linker script)
@@ -11,23 +13,9 @@ class PNM:
     Designed to be inherited by the TransformerBlockLlama class along with PIM class
     """
     
-    def PNM_RISCV_only_trace(self, instruction_id, cycles):
-        """
-        Simulate a RISC-V instruction on the PNM unit.
-        """
-        if "PNM_RISCV" in self.time:
-            self.time["PNM_RISCV"] += cycles
-        self.file.write(f"PNM_RISCV {instruction_id} {cycles}\n")
-
-    def PNM_RED_only_trace(self, channel_mask, src_row, dst_row, size):
-        """
-        Simulate a Reduction operation (e.g., Sum) in the PNM unit.
-        """
-        if "PNM_RED" in self.time:
-             self.time["PNM_RED"] += 1 
-        self.file.write(f"PNM_RED {channel_mask} {src_row} {dst_row} {size}\n")
-
     def RED(self, opsize, rd, rs):
+        """Stateful scalar reducer (reducer.sv): sum all bf16 lanes across opsize SB
+        registers, write the resulting scalar to lane 0 of rd, zero-pad lanes 1..15."""
         if not self.only_trace:
             if isinstance(rs, list):
                 src_regs = rs[:opsize]
@@ -45,23 +33,21 @@ class PNM:
             rd_val = rd[0] if isinstance(rd, list) else rd
             self.file.write(f"PNM_RED {opsize} {rd_val} {rs_val}\n")
 
-    def ACC(self, opsize, rd, rs):
+    def ACC(self, opsize, rd, rs1, rs2):
+        """Pairwise vector accumulator (accumulator.sv): SB[rd] = SB[rs1] + SB[rs2]
+        across all bf16 lanes. List operands stride over opsize entries."""
         if not self.only_trace:
-            if isinstance(rs, list):
-                src_regs = rs[:opsize]
+            if isinstance(rd, list) and isinstance(rs1, list) and isinstance(rs2, list):
+                for i in range(opsize):
+                    self.shared_buffer.registers[rd[i]] = self.shared_buffer.registers[rs1[i]] + self.shared_buffer.registers[rs2[i]]
             else:
-                src_regs = [rs + i for i in range(opsize)]
-
-            total_sum = sum(self.shared_buffer.registers[r].sum() for r in src_regs)
-
-            rd_reg = rd[0] if isinstance(rd, list) else rd
-            self.shared_buffer.registers[rd_reg] = torch.zeros(16, dtype=torch.bfloat16)
-            self.shared_buffer.registers[rd_reg][0] = total_sum
+                self.shared_buffer.registers[rd] = self.shared_buffer.registers[rs1] + self.shared_buffer.registers[rs2]
 
         if self.op_trace:
-            rs_val = rs[0] if isinstance(rs, list) else rs
+            rs1_val = rs1[0] if isinstance(rs1, list) else rs1
+            rs2_val = rs2[0] if isinstance(rs2, list) else rs2
             rd_val = rd[0] if isinstance(rd, list) else rd
-            self.file.write(f"PNM_ACC {opsize} {rd_val} {rs_val}\n")
+            self.file.write(f"PNM_ACC {opsize} {rd_val} {rs1_val} {rs2_val}\n")
 
     def EXP(self, opsize, rd, rs):
         if not self.only_trace:
