@@ -20,7 +20,10 @@ import torch
 from pnm_sim import PC_RMSNORM_SCALE
 
 NUM_LANES = 16
-OPSIZE_MAX = 63
+OPSIZE_WIDTH = 16
+REQUEST_WIDTH = 92
+OPSIZE_MAX = (1 << OPSIZE_WIDTH) - 1
+INSTR_HEX_WIDTH = (REQUEST_WIDTH + 3) // 4
 SCHEMA = "cent-cosim-jsonl"
 SCHEMA_VERSION = 1
 
@@ -28,6 +31,26 @@ RISCV = 16
 ISR_EOC = 18
 RED = 21
 ACC = 22
+
+PIM_OPCODES = {
+    "WR_SBK": 1,
+    "WR_GB": 2,
+    "WR_BIAS": 3,
+    "WR_AFLUT": 4,
+    "RD_MAC": 5,
+    "RD_AF": 6,
+    "RD_SBK": 7,
+    "COPY_BKGB": 8,
+    "COPY_GBBK": 9,
+    "MAC_SBK": 10,
+    "MAC_ABK": 11,
+    "AF": 12,
+    "EWMUL": 13,
+    "EWADD": 14,
+    "WR_ABK": 15,
+    "SYNC": 17,
+    "EOC": 18,
+}
 
 OPCODES = {
     "RISCV": RISCV,
@@ -113,17 +136,30 @@ def simulate_rmsnorm_scale_bf16(red_scalar_bf16, opsize):
     return float_to_bf16_int(scale_f32)
 
 
-def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0):
+def build_raw_instruction(cmd, ch_high=0, ch_low=0, opsize=0, bank=0, ro=0, co=0, r1=0):
     if not 0 <= opsize <= OPSIZE_MAX:
-        raise ValueError(f"opsize must fit in 6 bits: {opsize}")
+        raise ValueError(f"opsize must fit in {OPSIZE_WIDTH} bits: {opsize}")
     instr = 0
-    instr |= (cmd & 0x1F) << 77
-    instr |= ((pc >> 16) & 0xFFFF) << 61
-    instr |= (pc & 0xFFFF) << 45
-    instr |= (opsize & 0x3F) << 39
-    instr |= (r0 & 0x7FF) << 21
+    instr |= (cmd & 0x1F) << (REQUEST_WIDTH - 5)
+    instr |= (ch_high & 0xFFFF) << (39 + OPSIZE_WIDTH + 16)
+    instr |= (ch_low & 0xFFFF) << (39 + OPSIZE_WIDTH)
+    instr |= (opsize & OPSIZE_MAX) << 39
+    instr |= (bank & 0xF) << 35
+    instr |= (ro & 0x3FFF) << 21
+    instr |= (co & 0x3FF) << 11
     instr |= (r1 & 0x7FF)
     return instr
+
+
+def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0):
+    return build_raw_instruction(
+        cmd,
+        ch_high=(pc >> 16) & 0xFFFF,
+        ch_low=pc & 0xFFFF,
+        opsize=opsize,
+        ro=r0,
+        r1=r1,
+    )
 
 
 def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, case=None, note=None):
@@ -133,7 +169,7 @@ def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, case=None, note=None):
         "type": "instruction",
         "op": op,
         "execute": "control" if op == "ISR_EOC" else "hardware",
-        "encoded": f"0x{instr:021x}",
+        "encoded": f"0x{instr:0{INSTR_HEX_WIDTH}x}",
         "fields": {
             "cmd": cmd,
             "opsize": opsize,
@@ -322,7 +358,7 @@ def metadata_event(mode):
         "version": SCHEMA_VERSION,
         "mode": mode,
         "lanes_per_sb_entry": NUM_LANES,
-        "instruction_width_bits": 82,
+        "instruction_width_bits": REQUEST_WIDTH,
         "max_direct_opsize": OPSIZE_MAX,
         "hardware_supported_ops": HARDWARE_SUPPORTED_OPS,
         "unsupported_pim_policy": "mutate_shared_buffer_from_simulator_event",
@@ -435,6 +471,125 @@ def _single_channel_args(trace_file):
     return args
 
 
+def _hex_instruction(instr):
+    return f"0x{instr:0{INSTR_HEX_WIDTH}x}"
+
+
+def _bf16_lanes_from_tensor(values):
+    return tensor_to_bf16_hex(torch.as_tensor(values).flatten()[:NUM_LANES])
+
+
+def _sb_write_dict(addr, lanes_bf16, description):
+    return {
+        "target": "SB",
+        "addr": int(addr),
+        "lanes_bf16": [value.lower() for value in lanes_bf16],
+        "description": description,
+    }
+
+
+def _parse_chmask(token):
+    value = int(token, 0)
+    return (value >> 16) & 0xFFFF, value & 0xFFFF, value
+
+
+def _pim_instruction_event(line, line_no):
+    parts = line.split()
+    if len(parts) < 2 or parts[0] != "AiM":
+        return None
+
+    op = parts[1]
+    if op == "SYNC":
+        instr = build_raw_instruction(PIM_OPCODES["SYNC"])
+        return {
+            "type": "instruction",
+            "op": "ISR_SYNC",
+            "execute": "control",
+            "encoded": _hex_instruction(instr),
+            "legacy": {"line": line_no, "raw": line},
+            "fields": {"cmd": PIM_OPCODES["SYNC"], "opsize": 0},
+        }
+    if op == "EOC":
+        instr = build_raw_instruction(PIM_OPCODES["EOC"])
+        return {
+            "type": "instruction",
+            "op": "ISR_EOC",
+            "execute": "control",
+            "encoded": _hex_instruction(instr),
+            "legacy": {"line": line_no, "raw": line},
+            "fields": {"cmd": PIM_OPCODES["EOC"], "opsize": 0},
+        }
+
+    cmd = PIM_OPCODES.get(op)
+    if cmd is None:
+        return None
+
+    opsize = 0
+    bank = 0
+    ro = 0
+    co = 0
+    ch_high = 0
+    ch_low = 0
+    chmask = 0
+
+    if op in {"WR_BIAS", "RD_MAC", "RD_AF"} and len(parts) >= 4:
+        opsize = int(parts[2], 0)
+        ch_high, ch_low, chmask = _parse_chmask(parts[3])
+    elif op == "AF" and len(parts) >= 3:
+        ch_high, ch_low, chmask = _parse_chmask(parts[2])
+    elif op in {"MAC_ABK", "EWMUL"} and len(parts) >= 5:
+        opsize = int(parts[2], 0)
+        ch_high, ch_low, chmask = _parse_chmask(parts[3])
+        ro = int(parts[4], 0)
+        if len(parts) >= 6:
+            co = int(parts[5], 0)
+    elif op in {"COPY_BKGB", "COPY_GBBK"} and len(parts) >= 6:
+        opsize = int(parts[2], 0)
+        ch_high, ch_low, chmask = _parse_chmask(parts[3])
+        bank = int(parts[4], 0)
+        ro = int(parts[5], 0)
+    elif op == "WR_GB" and len(parts) >= 5:
+        opsize = int(parts[2], 0)
+        co = int(parts[3], 0)
+        ch_high, ch_low, chmask = _parse_chmask(parts[4])
+    elif op == "EWADD" and len(parts) >= 5:
+        opsize = int(parts[2], 0)
+        ro = int(parts[3], 0)
+        co = int(parts[4], 0)
+    elif op == "WR_ABK" and len(parts) >= 5:
+        opsize = int(parts[2], 0)
+        ch_high, ch_low, chmask = _parse_chmask(parts[3])
+        ro = int(parts[4], 0)
+    else:
+        return None
+
+    instr = build_raw_instruction(
+        cmd,
+        ch_high=ch_high,
+        ch_low=ch_low,
+        opsize=opsize,
+        bank=bank,
+        ro=ro,
+        co=co,
+    )
+    return {
+        "type": "instruction",
+        "op": f"PIM_{op}",
+        "execute": "noop",
+        "reason": "unsupported_pim_instruction",
+        "encoded": _hex_instruction(instr),
+        "legacy": {"line": line_no, "raw": line},
+        "fields": {
+            "cmd": cmd,
+            "chmask": f"0x{chmask:08x}",
+            "opsize": opsize,
+            "bank": bank,
+            "ro": ro,
+            "co": co,
+        },
+    }
+
+
 def _parse_legacy_trace_line(raw_line, line_no):
     line = raw_line.strip()
     if not line:
@@ -442,50 +597,60 @@ def _parse_legacy_trace_line(raw_line, line_no):
     parts = line.split()
     op = parts[0]
     event = {
-        "type": "legacy_trace_event",
-        "line": line_no,
-        "raw": line,
-        "execute": "simulated",
+        "type": "instruction",
+        "legacy": {"line": line_no, "raw": line},
     }
 
     if op == "PNM_RED" and len(parts) == 4:
         opsize = int(parts[1], 0)
-        event.update({"op": "RED", "opsize": opsize, "rd": int(parts[2], 0), "rs": int(parts[3], 0)})
+        event.update({"op": "RED", "execute": "hardware"})
+        rd = int(parts[2], 0)
+        rs = int(parts[3], 0)
+        event["fields"] = {"cmd": RED, "opsize": opsize, "r0": rd, "r1": rs}
         if opsize <= OPSIZE_MAX:
-            event["execute"] = "hardware"
-            event["encoded"] = f"0x{build_instruction(RED, opsize, event['rd'], event['rs']):021x}"
+            event["encoded"] = _hex_instruction(build_instruction(RED, opsize, rd, rs))
         else:
-            event["reason"] = "opsize_exceeds_6_bit_decoder_field"
+            event["reason"] = "opsize_exceeds_decoder_field"
     elif op == "PNM_ACC" and len(parts) == 5:
         opsize = int(parts[1], 0)
         rd = int(parts[2], 0)
         rs1 = int(parts[3], 0)
         rs2 = int(parts[4], 0)
-        event.update({"op": "ACC", "opsize": opsize, "rd": rd, "rs1": rs1, "rs2": rs2})
+        event.update({"op": "ACC", "execute": "hardware"})
+        event["fields"] = {"cmd": ACC, "opsize": opsize, "r0": rd, "r1": rs1, "rs2": rs2}
         if opsize <= OPSIZE_MAX and rs2 == rd:
-            event["execute"] = "hardware"
-            event["encoded"] = f"0x{build_instruction(ACC, opsize, rd, rs1):021x}"
+            event["encoded"] = _hex_instruction(build_instruction(ACC, opsize, rd, rs1))
         else:
             event["reason"] = "hardware_acc_uses_r0_as_destination_and_second_source"
     elif op == "PNM_RISCV" and len(parts) == 5:
-        opsize = int(parts[1], 0)
+        legacy_opsize = int(parts[1], 0)
         pc = int(parts[2], 0)
         rd = int(parts[3], 0)
         rs = int(parts[4], 0)
-        event.update({"op": "RISCV", "opsize": opsize, "pc": f"0x{pc:08x}", "rd": rd, "rs": rs})
+        event.update({"op": "RISCV", "execute": "hardware"})
+        event["fields"] = {
+            "cmd": RISCV,
+            "legacy_opsize": legacy_opsize,
+            "opsize": legacy_opsize,
+            "pc": f"0x{pc:08x}",
+            "r0": rd,
+            "r1": rs,
+        }
+        opsize = legacy_opsize
         if opsize <= OPSIZE_MAX:
-            event["execute"] = "hardware"
-            event["encoded"] = f"0x{build_instruction(RISCV, opsize, rd, rs, pc=pc):021x}"
+            event["encoded"] = _hex_instruction(build_instruction(RISCV, opsize, rd, rs, pc=pc))
             if pc == PC_RMSNORM_SCALE and opsize == 1:
                 event["semantic_note"] = (
                     "legacy simulator RMSNorm RISCV uses the block dim internally; "
-                    "hardware firmware interprets dim as opsize * 16"
+                    "JSONL replay replaces the encoded opsize with dim/16 and passes dim to firmware"
                 )
         else:
-            event["reason"] = "opsize_exceeds_6_bit_decoder_field"
+            event["reason"] = "opsize_exceeds_decoder_field"
     else:
-        event["op"] = op.replace("AiM", "PIM")
-        event["reason"] = "unsupported_pim_instruction"
+        pim_event = _pim_instruction_event(line, line_no)
+        if pim_event is not None:
+            return pim_event
+        event.update({"op": op.replace("AiM", "PIM"), "execute": "noop", "reason": "unsupported_instruction"})
     return event
 
 
@@ -503,10 +668,11 @@ def generate_single_channel_contract(trace_file):
         dic_model = get_test_inputs()
         args = _single_channel_args(legacy_trace)
         block = TransformerBlockLlama(dic_model, args)
+        block.cosim_trace_events = []
         block.memory_mapping()
         block.memory_mapping_verification()
         sa_aim = block.self_attention_aim()
-        block.FFN_aim(sa_aim)
+        out_aim = block.FFN_aim(sa_aim)
         if hasattr(block, "file"):
             block.file.flush()
             block.file.close()
@@ -523,12 +689,155 @@ def generate_single_channel_contract(trace_file):
                 ),
             },
         ]
+        pnm_events = iter(block.cosim_trace_events)
+        last_red = None
         with legacy_trace.open("r", encoding="utf-8") as legacy:
             for line_no, raw_line in enumerate(legacy, start=1):
                 event = _parse_legacy_trace_line(raw_line, line_no)
-                if event:
+                if not event:
+                    continue
+
+                if event.get("op") == "RED":
+                    red_record = next(pnm_events, None)
+                    if red_record is None or red_record.get("kind") != "RED":
+                        raise RuntimeError(f"Missing simulator RED record for legacy line {line_no}")
+
+                    writes = [
+                        _sb_write_dict(reg, _bf16_lanes_from_tensor(value), "RED source vector from simulator SB")
+                        for reg, value in zip(red_record["src_regs"], red_record["src_values"])
+                    ]
+                    events.append(simulate_event(
+                        "single_channel",
+                        "SB_STATE_BEFORE_RED",
+                        writes,
+                        "cent_simulator.shared_buffer.RED_inputs",
+                    ))
+
+                    event["fields"].update({
+                        "opsize": int(red_record["opsize"]),
+                        "r0": int(red_record["rd"]),
+                        "r1": int(red_record["rs"]),
+                    })
+                    event["encoded"] = _hex_instruction(build_instruction(
+                        RED,
+                        int(red_record["opsize"]),
+                        int(red_record["rd"]),
+                        int(red_record["rs"]),
+                    ))
+                    event["simulator"] = {
+                        "source_register_count": len(red_record["src_regs"]),
+                        "source_registers": [int(reg) for reg in red_record["src_regs"]],
+                    }
                     events.append(event)
+
+                    expected = _bf16_lanes_from_tensor(red_record["result"])
+                    events.append(check_event(
+                        "single_channel",
+                        int(red_record["rd"]),
+                        "scalar_lane0_zero_rest",
+                        expected,
+                        max_ulp=1,
+                        source="RED hardware output",
+                    ))
+                    last_red = {
+                        "rd": int(red_record["rd"]),
+                        "expected": expected,
+                    }
+                    continue
+
+                if event.get("op") == "RISCV":
+                    riscv_record = next(pnm_events, None)
+                    if riscv_record is None or riscv_record.get("kind") != "RISCV":
+                        raise RuntimeError(f"Missing simulator RISCV record for legacy line {line_no}")
+
+                    dim = int(riscv_record["dim"])
+                    vector_opsize = (dim + NUM_LANES - 1) // NUM_LANES
+                    rd = int(riscv_record["rd"])
+                    rs = int(riscv_record["rs"])
+                    pc = int(riscv_record["pc"])
+                    event["fields"].update({
+                        "legacy_opsize": int(riscv_record["opsize"]),
+                        "opsize": vector_opsize,
+                        "dim": dim,
+                        "pc": f"0x{pc:08x}",
+                        "r0": rd,
+                        "r1": rs,
+                    })
+                    event["encoded"] = _hex_instruction(build_instruction(
+                        RISCV,
+                        vector_opsize,
+                        rd,
+                        rs,
+                        pc=pc,
+                    ))
+
+                    input_lanes = _bf16_lanes_from_tensor(riscv_record["input"])
+                    if last_red is not None and last_red["expected"][0] == input_lanes[0]:
+                        events.append({
+                            "type": "sb_copy",
+                            "case": "single_channel",
+                            "source": "hardware_RED_to_RISCV_input",
+                            "source_addr": last_red["rd"],
+                            "dest_addr": rs,
+                            "expected_lanes_bf16": input_lanes,
+                            "reason": "simulator_accumulated_scalar_is_same_as_previous_RED_result",
+                        })
+                    else:
+                        events.append(simulate_event(
+                            "single_channel",
+                            "SB_STATE_BEFORE_RISCV",
+                            [_sb_write_dict(rs, input_lanes, "RISCV source scalar from simulator SB")],
+                            "cent_simulator.shared_buffer.RISCV_input",
+                        ))
+
+                    event["simulator"] = {
+                        "dim": dim,
+                        "input_lanes_bf16": input_lanes,
+                        "expected_lanes_bf16": _bf16_lanes_from_tensor(riscv_record["result"]),
+                    }
+                    events.append(event)
+                    events.append(check_event(
+                        "single_channel",
+                        rd,
+                        "bf16_broadcast",
+                        event["simulator"]["expected_lanes_bf16"],
+                        max_ulp=1,
+                        source="RISCV RMSNorm scale using explicit dim",
+                    ))
+                    last_red = None
+                    continue
+
+                events.append(event)
         events.append(instruction_event("ISR_EOC"))
+
+        golden_out = dic_model["out"]
+        sim_out = out_aim
+        diff = (torch.as_tensor(sim_out).to(torch.float32) - torch.as_tensor(golden_out).to(torch.float32)).abs()
+        events.append({
+            "type": "final_tensor_check",
+            "case": "single_channel",
+            "name": "out",
+            "source": "test_single_channel.py golden out",
+            "shape": list(golden_out.shape),
+            "dtype": "bf16",
+            "simulated_bf16": tensor_to_bf16_hex(sim_out),
+            "golden_bf16": tensor_to_bf16_hex(golden_out),
+            "max_abs_error": float(diff.max().item()),
+            "mean_abs_error": float(diff.mean().item()),
+            "atol": 0.05,
+        })
+
+        instruction_events = [event for event in events if event.get("type") == "instruction"]
+        events[0]["instruction_count"] = len(instruction_events)
+        events[0]["hardware_instruction_count"] = sum(
+            1 for event in instruction_events if event.get("execute") == "hardware"
+        )
+        events[0]["noop_instruction_count"] = sum(
+            1 for event in instruction_events if event.get("execute") == "noop"
+        )
+        events[0]["mutation_event_count"] = sum(
+            1 for event in events if event.get("type") in {"simulate", "sb_write", "sb_copy"}
+        )
 
         with trace_file.open("w", encoding="utf-8") as output:
             for event in events:

@@ -16,17 +16,31 @@ class PNM:
     def RED(self, opsize, rd, rs):
         """Stateful scalar reducer (reducer.sv): sum all bf16 lanes across opsize SB
         registers, write the resulting scalar to lane 0 of rd, zero-pad lanes 1..15."""
+        cosim_event = None
         if not self.only_trace:
             if isinstance(rs, list):
                 src_regs = rs[:opsize]
             else:
                 src_regs = [rs + i for i in range(opsize)]
+            src_values = [self.shared_buffer.registers[r].clone() for r in src_regs]
 
             total_sum = sum(self.shared_buffer.registers[r].sum() for r in src_regs)
 
             rd_reg = rd[0] if isinstance(rd, list) else rd
             self.shared_buffer.registers[rd_reg] = torch.zeros(16, dtype=torch.bfloat16)
             self.shared_buffer.registers[rd_reg][0] = total_sum
+            cosim_event = {
+                "kind": "RED",
+                "opsize": opsize,
+                "rd": rd_reg,
+                "rs": src_regs[0] if src_regs else (rs[0] if isinstance(rs, list) else rs),
+                "src_regs": src_regs,
+                "src_values": src_values,
+                "result": self.shared_buffer.registers[rd_reg].clone(),
+            }
+
+        if cosim_event is not None and hasattr(self, "cosim_trace_events"):
+            self.cosim_trace_events.append(cosim_event)
 
         if self.op_trace:
             rs_val = rs[0] if isinstance(rs, list) else rs
@@ -105,9 +119,11 @@ class PNM:
         Functional model of the RISC-V BOOM core acting as a slave functional unit.
         The Orchestrator provides a PC (firmware entry point) and register IDs.
         """
+        cosim_event = None
         if not self.only_trace:
             rs_reg = rs[0] if isinstance(rs, list) else rs
             rd_reg = rd[0] if isinstance(rd, list) else rd
+            input_value = self.shared_buffer.registers[rs_reg].clone()
             
             if pc == PC_RMSNORM_SCALE:
                 # Firmware: Read sum(x^2), compute 1/sqrt(sum/dim + eps)
@@ -126,6 +142,20 @@ class PNM:
                 exp_sum = self.shared_buffer.registers[rs_reg][0]
                 scale = 1.0 / (exp_sum + 1e-10)
                 self.shared_buffer.registers[rd_reg] = torch.full((16,), scale.item(), dtype=torch.bfloat16)
+
+            cosim_event = {
+                "kind": "RISCV",
+                "opsize": opsize,
+                "pc": pc,
+                "rd": rd_reg,
+                "rs": rs_reg,
+                "dim": int(self.dim),
+                "input": input_value,
+                "result": self.shared_buffer.registers[rd_reg].clone(),
+            }
+
+        if cosim_event is not None and hasattr(self, "cosim_trace_events"):
+            self.cosim_trace_events.append(cosim_event)
 
         if self.op_trace:
             rs_val = rs[0] if isinstance(rs, list) else rs
