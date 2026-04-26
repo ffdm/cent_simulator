@@ -7,19 +7,24 @@ import torch.nn.functional as F
 from Llama import TransformerBlockLlama
 from utils import RMSNorm, apply_rotary_emb
 
+def get_single_channel_input_x(dim=4096):
+    """Return the deterministic single-channel input tensor without building weights."""
+    torch.manual_seed(42)
+    return torch.randn((1, 1, dim)) * 0.1
+
 def get_test_inputs():
     dim = 4096
     n_heads = 32
     head_dim = dim // n_heads
 
     # Set seed for reproducibility across different test environments
-    torch.manual_seed(42)
+    x = get_single_channel_input_x(dim)
 
     dic_model = {
         "dim": torch.tensor(dim),
         "n_heads": torch.tensor(n_heads),
         "TP_param": torch.tensor(1),
-        "x": torch.randn((1, 1, dim)) * 0.1,
+        "x": x,
         "SANorm": torch.ones(dim),
         "FFNNorm": torch.ones(dim),
         "sa": torch.zeros((1, 1, dim)),
