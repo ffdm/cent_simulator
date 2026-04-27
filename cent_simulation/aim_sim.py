@@ -116,7 +116,7 @@ class PIM():
         dimm_size = channel_size * self.num_channels
         addr = dimm_index * dimm_size + channel_index * channel_size + bank_index * bank_size + row_index * self.DRAM_column + col
         return addr
-    
+
     def store_to_DRAM_single_bank(self, dimm_index, channel_index, bank_index, row_index, col_index, size, data, op_trace):
         # GDDR6 stores with 32B granularity
         if op_trace and dimm_index == 0:
@@ -180,8 +180,16 @@ class PIM():
             result.append(self.pim_device["dimm_" + str(dimm)].dimm["channel_" + str(channel)].channel["bank_" + str(bank)].latch[latch_index])
         
         if not self.only_trace and hasattr(self, 'shared_buffer') and dest_regs is not None:
-            dest_reg = dest_regs[0] if isinstance(dest_regs, list) else dest_regs
-            self.shared_buffer.registers[dest_reg] = torch.tensor(result, dtype=torch.bfloat16)
+            if isinstance(dest_regs, list):
+                lane_count = self.num_banks
+                for index, dest_reg in enumerate(dest_regs):
+                    start = index * lane_count
+                    lanes = result[start:start + lane_count]
+                    if len(lanes) < lane_count:
+                        lanes = lanes + [0 for _ in range(lane_count - len(lanes))]
+                    self.shared_buffer.registers[dest_reg] = torch.tensor(lanes, dtype=torch.bfloat16)
+            else:
+                self.shared_buffer.registers[dest_regs] = torch.tensor(result, dtype=torch.bfloat16)
             
         return result
     
@@ -395,4 +403,3 @@ class PIM():
                 B[0][0][i*self.DRAM_column:(i+1)*self.DRAM_column]) for i in range(n-1)]
         lst.append(self.Vector_Vector_EWADD_Row(A[0][0][(n-1)*self.DRAM_column:], B[0][0][(n-1)*self.DRAM_column:]))
         return torch.cat(lst).reshape(A.shape)
-    

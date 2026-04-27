@@ -86,9 +86,11 @@ class TransformerBlockLlama(TransformerBlock):
         if self.pim_compute:
             x_pow_sum = 0
             op_size = (self.dic_shape["x_neighbor_bank"][0] - 1) // self.burst_length + 1
+            red_source_count = self.num_banks
             mac_regs = {}
             for channel in channel_lst:
-                mac_regs[channel] = self.shared_buffer.allocate(op_size)
+                mac_regs[channel] = self.shared_buffer.allocate(red_source_count)
+            rmsnorm_input_reg = None
             for channel in channel_lst:
                 op_trace = channel == 0 and self.trace_norm
                 mac_regs_ch = mac_regs[channel]
@@ -97,17 +99,23 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads x^2 results into shared buffer
                 
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
+                self.RED(opsize=red_source_count, rd=reduced_reg[0], rs=mac_regs_ch)
                 x_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
-                self.shared_buffer.free(reduced_reg)
+                if channels_required == 1:
+                    rmsnorm_input_reg = reduced_reg[0]
+                else:
+                    self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
 
             compare(torch.tensor(x_pow_sum, dtype=torch.bfloat16), self.x.pow(2).sum().to(torch.bfloat16), "x_pow_sum")
             
             # Use RISCV for div and rsqrt
-            input_reg = self.shared_buffer.allocate(1)
+            if rmsnorm_input_reg is None:
+                input_reg = self.shared_buffer.allocate(1)
+                self.shared_buffer.registers[input_reg[0]][0] = x_pow_sum
+            else:
+                input_reg = [rmsnorm_input_reg]
             output_reg = self.shared_buffer.allocate(1)
-            self.shared_buffer.registers[input_reg[0]][0] = x_pow_sum
             self.RISCV(1, PC_RMSNORM_SCALE, output_reg, input_reg)
             norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item() # scalar value
             norm_tensor = torch.full(self.x.shape, norm_tensor_item)
@@ -462,9 +470,11 @@ class TransformerBlockLlama(TransformerBlock):
             self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.x.shape[-1] // self.burst_length
             sa_pow_sum = 0
             op_size = (self.dic_shape["sa_neighbor_bank"][0] - 1) // self.burst_length + 1
+            red_source_count = self.num_banks
             mac_regs = {}
             for channel in channel_lst:
-                mac_regs[channel] = self.shared_buffer.allocate(op_size)
+                mac_regs[channel] = self.shared_buffer.allocate(red_source_count)
+            rmsnorm_input_reg = None
             for channel in channel_lst:
                 op_trace = channel == 0 and self.trace_norm
                 mac_regs_ch = mac_regs[channel]
@@ -473,17 +483,23 @@ class TransformerBlockLlama(TransformerBlock):
                 mac_lst = self.RD_MAC(0, channel, channels_required, 0, op_trace, dest_regs=mac_regs_ch) # Reads sa^2 results into shared buffer
                 
                 reduced_reg = self.shared_buffer.allocate(1)
-                self.RED(opsize=op_size, rd=reduced_reg[0], rs=mac_regs_ch)
+                self.RED(opsize=red_source_count, rd=reduced_reg[0], rs=mac_regs_ch)
                 sa_pow_sum += self.shared_buffer.registers[reduced_reg[0]][0].item()
-                self.shared_buffer.free(reduced_reg)
+                if channels_required == 1:
+                    rmsnorm_input_reg = reduced_reg[0]
+                else:
+                    self.shared_buffer.free(reduced_reg)
                 self.shared_buffer.free(mac_regs_ch)
 
             compare(torch.tensor(sa_pow_sum, dtype=torch.bfloat16), sa_aim.pow(2).sum().to(torch.bfloat16), "sa_pow_sum")
 
             # Use RISCV for div and rsqrt
-            input_reg = self.shared_buffer.allocate(1)
+            if rmsnorm_input_reg is None:
+                input_reg = self.shared_buffer.allocate(1)
+                self.shared_buffer.registers[input_reg[0]][0] = sa_pow_sum
+            else:
+                input_reg = [rmsnorm_input_reg]
             output_reg = self.shared_buffer.allocate(1)
-            self.shared_buffer.registers[input_reg[0]][0] = sa_pow_sum
             self.RISCV(1, PC_RMSNORM_SCALE, output_reg, input_reg)
             norm_tensor_item = self.shared_buffer.registers[output_reg[0]][0].item()
             norm_tensor = torch.full(sa_aim.shape, norm_tensor_item)

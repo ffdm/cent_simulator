@@ -21,16 +21,21 @@ from pnm_sim import PC_RMSNORM_SCALE
 
 NUM_LANES = 16
 OPSIZE_WIDTH = 16
-REQUEST_WIDTH = 92
+RISCV_DIM_WIDTH = 20
+CTX_ID_WIDTH = 4
+REQUEST_WIDTH = 64
 OPSIZE_MAX = (1 << OPSIZE_WIDTH) - 1
 INSTR_HEX_WIDTH = (REQUEST_WIDTH + 3) // 4
 SCHEMA = "cent-cosim-jsonl"
 SCHEMA_VERSION = 1
 
 RISCV = 16
+ISR_SYNC = 17
 ISR_EOC = 18
+SET_CHMASK = 19
 RED = 21
 ACC = 22
+SET_RISCV_CTX = 23
 
 PIM_OPCODES = {
     "WR_SBK": 1,
@@ -54,9 +59,12 @@ PIM_OPCODES = {
 
 OPCODES = {
     "RISCV": RISCV,
+    "ISR_SYNC": ISR_SYNC,
     "ISR_EOC": ISR_EOC,
+    "SET_CHMASK": SET_CHMASK,
     "RED": RED,
     "ACC": ACC,
+    "SET_RISCV_CTX": SET_RISCV_CTX,
 }
 HARDWARE_SUPPORTED_OPS = ["RED", "ACC", "RISCV"]
 
@@ -124,9 +132,9 @@ def simulate_red_bf16(vectors_bf16):
     return accum, steps
 
 
-def simulate_rmsnorm_scale_bf16(red_scalar_bf16, opsize):
+def simulate_rmsnorm_scale_bf16(red_scalar_bf16, dim):
     sum_f32 = np.float32(bf16_int_to_float(red_scalar_bf16))
-    dim_f32 = np.float32(opsize * NUM_LANES)
+    dim_f32 = np.float32(dim)
     eps_f32 = np.float32(1e-5)
     one_f32 = np.float32(1.0)
     mean_f32 = sum_f32 / dim_f32
@@ -136,13 +144,41 @@ def simulate_rmsnorm_scale_bf16(red_scalar_bf16, opsize):
     return float_to_bf16_int(scale_f32)
 
 
-def build_raw_instruction(cmd, ch_high=0, ch_low=0, opsize=0, bank=0, ro=0, co=0, r1=0):
+def _check_ctx_id(ctx_id):
+    if not 0 <= ctx_id < (1 << CTX_ID_WIDTH):
+        raise ValueError(f"context id must fit in {CTX_ID_WIDTH} bits: {ctx_id}")
+
+
+def build_set_chmask(ctx_id, chmask):
+    _check_ctx_id(ctx_id)
+    instr = 0
+    instr |= (SET_CHMASK & 0x1F) << 59
+    instr |= (ctx_id & 0xF) << 55
+    instr |= (int(chmask) & 0xFFFFFFFF) << 23
+    return instr
+
+
+def build_set_riscv_ctx(ctx_id, pc, dim):
+    _check_ctx_id(ctx_id)
+    _check_riscv_dim(dim)
+    instr = 0
+    instr |= (SET_RISCV_CTX & 0x1F) << 59
+    instr |= (ctx_id & 0xF) << 55
+    instr |= (int(pc) & 0xFFFFFFFF) << 23
+    instr |= (int(dim) & ((1 << RISCV_DIM_WIDTH) - 1)) << 3
+    return instr
+
+
+def build_raw_instruction(cmd, ch_high=0, ch_low=0, chmask_id=0, opsize=0, bank=0, ro=0, co=0, r1=0):
     if not 0 <= opsize <= OPSIZE_MAX:
         raise ValueError(f"opsize must fit in {OPSIZE_WIDTH} bits: {opsize}")
+    _check_ctx_id(chmask_id)
     instr = 0
-    instr |= (cmd & 0x1F) << (REQUEST_WIDTH - 5)
-    instr |= (ch_high & 0xFFFF) << (39 + OPSIZE_WIDTH + 16)
-    instr |= (ch_low & 0xFFFF) << (39 + OPSIZE_WIDTH)
+    instr |= (cmd & 0x1F) << 59
+    if cmd & 0x18 == 0x18:
+        instr |= (ch_high & 0xFFFF) << 43
+    else:
+        instr |= (chmask_id & 0xF) << 55
     instr |= (opsize & OPSIZE_MAX) << 39
     instr |= (bank & 0xF) << 35
     instr |= (ro & 0x3FFF) << 21
@@ -151,20 +187,35 @@ def build_raw_instruction(cmd, ch_high=0, ch_low=0, opsize=0, bank=0, ro=0, co=0
     return instr
 
 
-def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0):
-    return build_raw_instruction(
+def _check_riscv_dim(dim):
+    if not 0 <= dim < (1 << RISCV_DIM_WIDTH):
+        raise ValueError(f"RISCV dim must fit in {RISCV_DIM_WIDTH} bits: {dim}")
+
+
+def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0, dim=0, ctx_id=0, chmask_id=0):
+    del pc, dim
+    bank = 0
+    ro = r0
+    co = 0
+    if cmd == RISCV:
+        _check_ctx_id(ctx_id)
+        chmask_id = ctx_id
+        ro = r0 & 0x7FF
+    instr = build_raw_instruction(
         cmd,
-        ch_high=(pc >> 16) & 0xFFFF,
-        ch_low=pc & 0xFFFF,
+        chmask_id=chmask_id,
         opsize=opsize,
-        ro=r0,
+        bank=bank,
+        ro=ro,
+        co=co,
         r1=r1,
     )
+    return instr
 
 
-def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, case=None, note=None):
+def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, dim=0, ctx_id=0, case=None, note=None):
     cmd = OPCODES[op]
-    instr = build_instruction(cmd, opsize=opsize, r0=rd, r1=rs, pc=pc)
+    instr = build_instruction(cmd, opsize=opsize, r0=rd, r1=rs, pc=pc, dim=dim, ctx_id=ctx_id)
     event = {
         "type": "instruction",
         "op": op,
@@ -175,9 +226,14 @@ def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, case=None, note=None):
             "opsize": opsize,
             "r0": rd,
             "r1": rs,
-            "pc": f"0x{pc:08x}",
         },
     }
+    if op == "RISCV":
+        event["fields"]["ctx_id"] = ctx_id
+        event["fields"]["pc"] = f"0x{pc:08x}"
+        event["fields"]["dim"] = dim
+    if op in {"SET_CHMASK", "SET_RISCV_CTX"}:
+        event["execute"] = "context"
     if case is not None:
         event["case"] = case
     if op == "ACC":
@@ -185,6 +241,37 @@ def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, case=None, note=None):
     if note:
         event["note"] = note
     return event
+
+
+def set_chmask_event(ctx_id, chmask):
+    instr = build_set_chmask(ctx_id, chmask)
+    return {
+        "type": "instruction",
+        "op": "SET_CHMASK",
+        "execute": "context",
+        "encoded": _hex_instruction(instr),
+        "fields": {
+            "cmd": SET_CHMASK,
+            "ctx_id": ctx_id,
+            "chmask": f"0x{int(chmask) & 0xFFFFFFFF:08x}",
+        },
+    }
+
+
+def set_riscv_ctx_event(ctx_id, pc, dim):
+    instr = build_set_riscv_ctx(ctx_id, pc, dim)
+    return {
+        "type": "instruction",
+        "op": "SET_RISCV_CTX",
+        "execute": "context",
+        "encoded": _hex_instruction(instr),
+        "fields": {
+            "cmd": SET_RISCV_CTX,
+            "ctx_id": ctx_id,
+            "pc": f"0x{int(pc) & 0xFFFFFFFF:08x}",
+            "dim": int(dim),
+        },
+    }
 
 
 def sb_write_event(case, addr, lanes_bf16, source):
@@ -225,6 +312,80 @@ def check_event(case, addr, kind, expected_lanes_bf16, max_ulp=0, source=None):
     return event
 
 
+def _parse_contract_pc(value):
+    return int(value, 0) if isinstance(value, str) else int(value)
+
+
+def _add_context_preamble(instruction_events):
+    chmask_to_ctx = {}
+    riscv_to_ctx = {}
+    next_chmask_ctx = 0
+    next_riscv_ctx = 0
+
+    for event in instruction_events:
+        if event.get("type") != "instruction":
+            continue
+        fields = event.get("fields", {})
+        if event.get("execute") == "noop" and "chmask" in fields:
+            chmask = int(fields["chmask"], 0) if isinstance(fields["chmask"], str) else int(fields["chmask"])
+            if chmask not in chmask_to_ctx:
+                if next_chmask_ctx >= (1 << CTX_ID_WIDTH):
+                    raise ValueError("Too many unique channel masks for fixed 64-bit ISA context table")
+                chmask_to_ctx[chmask] = next_chmask_ctx
+                next_chmask_ctx += 1
+        elif event.get("op") == "RISCV":
+            pc = _parse_contract_pc(fields.get("pc", 0))
+            dim = int(fields.get("dim", 0))
+            key = (pc, dim)
+            if key not in riscv_to_ctx:
+                if next_riscv_ctx >= (1 << CTX_ID_WIDTH):
+                    raise ValueError("Too many unique RISCV pc/dim pairs for fixed 64-bit ISA context table")
+                riscv_to_ctx[key] = next_riscv_ctx
+                next_riscv_ctx += 1
+
+    preamble = [
+        set_chmask_event(ctx_id, chmask)
+        for chmask, ctx_id in chmask_to_ctx.items()
+    ]
+    preamble.extend(
+        set_riscv_ctx_event(ctx_id, pc, dim)
+        for (pc, dim), ctx_id in riscv_to_ctx.items()
+    )
+
+    for event in instruction_events:
+        fields = event.get("fields", {})
+        if event.get("execute") == "noop" and "chmask" in fields:
+            chmask = int(fields["chmask"], 0) if isinstance(fields["chmask"], str) else int(fields["chmask"])
+            ctx_id = chmask_to_ctx[chmask]
+            fields["ctx_id"] = ctx_id
+            fields["chmask_id"] = ctx_id
+            event["encoded"] = _hex_instruction(build_raw_instruction(
+                int(fields["cmd"]),
+                chmask_id=ctx_id,
+                opsize=int(fields.get("opsize", 0)),
+                bank=int(fields.get("bank", 0)),
+                ro=int(fields.get("ro", fields.get("r0", 0))),
+                co=int(fields.get("co", 0)),
+                r1=int(fields.get("r1", 0)),
+            ))
+        elif event.get("op") == "RISCV":
+            pc = _parse_contract_pc(fields.get("pc", 0))
+            dim = int(fields.get("dim", 0))
+            ctx_id = riscv_to_ctx[(pc, dim)]
+            fields["ctx_id"] = ctx_id
+            event["encoded"] = _hex_instruction(build_instruction(
+                RISCV,
+                int(fields.get("opsize", 0)),
+                int(fields.get("r0", 0)),
+                int(fields.get("r1", 0)),
+                pc=pc,
+                dim=dim,
+                ctx_id=ctx_id,
+            ))
+
+    return preamble + instruction_events
+
+
 def rmsnorm_case(name, source, x_values, layout, include_acc=True):
     opsize = layout["opsize"]
     if not 1 <= opsize <= OPSIZE_MAX:
@@ -238,7 +399,7 @@ def rmsnorm_case(name, source, x_values, layout, include_acc=True):
     squared = (x * x).to(torch.bfloat16)
     vectors = pack_chunks(squared, NUM_LANES)
     red_scalar, red_steps = simulate_red_bf16(vectors)
-    scale = simulate_rmsnorm_scale_bf16(red_scalar, opsize)
+    scale = simulate_rmsnorm_scale_bf16(red_scalar, dim)
 
     setup = [
         {
@@ -248,6 +409,7 @@ def rmsnorm_case(name, source, x_values, layout, include_acc=True):
             "phase": "rmsnorm_subgraph",
             "dim": dim,
             "opsize": opsize,
+            "riscv_opsize": 1,
             "layout": layout,
             "contract": {
                 "unsupported_pim_is_simulated_by_sb_mutation": True,
@@ -314,10 +476,11 @@ def rmsnorm_case(name, source, x_values, layout, include_acc=True):
         instruction_event("RED", opsize=opsize, rd=layout["red_addr"], rs=layout["data_base"], case=name),
         instruction_event(
             "RISCV",
-            opsize=opsize,
+            opsize=1,
             rd=layout["riscv_addr"],
             rs=layout["red_addr"],
             pc=PC_RMSNORM_SCALE,
+            dim=dim,
             case=name,
         ),
     ])
@@ -359,6 +522,9 @@ def metadata_event(mode):
         "mode": mode,
         "lanes_per_sb_entry": NUM_LANES,
         "instruction_width_bits": REQUEST_WIDTH,
+        "riscv_dim_width_bits": RISCV_DIM_WIDTH,
+        "context_id_width_bits": CTX_ID_WIDTH,
+        "isa_encoding": "fixed64_context_v2",
         "max_direct_opsize": OPSIZE_MAX,
         "hardware_supported_ops": HARDWARE_SUPPORTED_OPS,
         "unsupported_pim_policy": "mutate_shared_buffer_from_simulator_event",
@@ -424,7 +590,7 @@ def generate_rmsnorm_contract(trace_file, opsize=4, seed=123, include_random=Tru
         raise ValueError("No RMSNorm cases selected")
 
     events.extend(all_setup)
-    events.extend(all_instructions)
+    events.extend(_add_context_preamble(all_instructions))
     events.append(instruction_event("ISR_EOC"))
     events.extend(all_checks)
 
@@ -565,8 +731,7 @@ def _pim_instruction_event(line, line_no):
 
     instr = build_raw_instruction(
         cmd,
-        ch_high=ch_high,
-        ch_low=ch_low,
+        chmask_id=0,
         opsize=opsize,
         bank=bank,
         ro=ro,
@@ -627,23 +792,23 @@ def _parse_legacy_trace_line(raw_line, line_no):
         pc = int(parts[2], 0)
         rd = int(parts[3], 0)
         rs = int(parts[4], 0)
+        dim = legacy_opsize * NUM_LANES
+        riscv_opsize = 1 if pc == PC_RMSNORM_SCALE else legacy_opsize
         event.update({"op": "RISCV", "execute": "hardware"})
         event["fields"] = {
             "cmd": RISCV,
             "legacy_opsize": legacy_opsize,
-            "opsize": legacy_opsize,
+            "opsize": riscv_opsize,
+            "dim": dim,
             "pc": f"0x{pc:08x}",
             "r0": rd,
             "r1": rs,
         }
-        opsize = legacy_opsize
+        opsize = riscv_opsize
         if opsize <= OPSIZE_MAX:
-            event["encoded"] = _hex_instruction(build_instruction(RISCV, opsize, rd, rs, pc=pc))
-            if pc == PC_RMSNORM_SCALE and opsize == 1:
-                event["semantic_note"] = (
-                    "legacy simulator RMSNorm RISCV uses the block dim internally; "
-                    "JSONL replay replaces the encoded opsize with dim/16 and passes dim to firmware"
-                )
+            event["encoded"] = _hex_instruction(build_instruction(RISCV, opsize, rd, rs, pc=pc, dim=dim))
+            if pc == PC_RMSNORM_SCALE:
+                event["semantic_note"] = "RISCV opsize is an operation count; dim is passed separately"
         else:
             event["reason"] = "opsize_exceeds_decoder_field"
     else:
@@ -751,13 +916,13 @@ def generate_single_channel_contract(trace_file):
                         raise RuntimeError(f"Missing simulator RISCV record for legacy line {line_no}")
 
                     dim = int(riscv_record["dim"])
-                    vector_opsize = (dim + NUM_LANES - 1) // NUM_LANES
+                    riscv_opsize = int(riscv_record["opsize"])
                     rd = int(riscv_record["rd"])
                     rs = int(riscv_record["rs"])
                     pc = int(riscv_record["pc"])
                     event["fields"].update({
                         "legacy_opsize": int(riscv_record["opsize"]),
-                        "opsize": vector_opsize,
+                        "opsize": riscv_opsize,
                         "dim": dim,
                         "pc": f"0x{pc:08x}",
                         "r0": rd,
@@ -765,23 +930,21 @@ def generate_single_channel_contract(trace_file):
                     })
                     event["encoded"] = _hex_instruction(build_instruction(
                         RISCV,
-                        vector_opsize,
+                        riscv_opsize,
                         rd,
                         rs,
                         pc=pc,
+                        dim=dim,
                     ))
 
                     input_lanes = _bf16_lanes_from_tensor(riscv_record["input"])
                     if last_red is not None and last_red["expected"][0] == input_lanes[0]:
-                        events.append({
-                            "type": "sb_copy",
-                            "case": "single_channel",
-                            "source": "hardware_RED_to_RISCV_input",
-                            "source_addr": last_red["rd"],
-                            "dest_addr": rs,
-                            "expected_lanes_bf16": input_lanes,
-                            "reason": "simulator_accumulated_scalar_is_same_as_previous_RED_result",
-                        })
+                        if rs != last_red["rd"]:
+                            raise RuntimeError(
+                                "Simulator RED/RISCV handoff used different SB addresses: "
+                                f"RED rd={last_red['rd']} RISCV rs={rs} at legacy line {line_no}"
+                            )
+                        event["handoff"] = "riscv_reads_previous_red_destination"
                     else:
                         events.append(simulate_event(
                             "single_channel",
@@ -808,6 +971,12 @@ def generate_single_channel_contract(trace_file):
                     continue
 
                 events.append(event)
+        body_instruction_events = [
+            event for event in events[2:] if event.get("type") == "instruction"
+        ]
+        contextualized = _add_context_preamble(body_instruction_events)
+        context_preamble = contextualized[:len(contextualized) - len(body_instruction_events)]
+        events = events[:2] + context_preamble + events[2:]
         events.append(instruction_event("ISR_EOC"))
 
         golden_out = dic_model["out"]
@@ -835,8 +1004,11 @@ def generate_single_channel_contract(trace_file):
         events[0]["noop_instruction_count"] = sum(
             1 for event in instruction_events if event.get("execute") == "noop"
         )
+        events[0]["context_instruction_count"] = sum(
+            1 for event in instruction_events if event.get("execute") == "context"
+        )
         events[0]["mutation_event_count"] = sum(
-            1 for event in events if event.get("type") in {"simulate", "sb_write", "sb_copy"}
+            1 for event in events if event.get("type") in {"simulate", "sb_write"}
         )
 
         with trace_file.open("w", encoding="utf-8") as output:
