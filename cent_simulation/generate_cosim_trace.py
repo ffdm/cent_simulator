@@ -20,22 +20,32 @@ import torch
 from pnm_sim import PC_RMSNORM_SCALE
 
 NUM_LANES = 16
-OPSIZE_WIDTH = 16
+ISA_SELECTOR_WIDTH = 6
+ISA_OPSIZE_WIDTH = 10
+OPSIZE_DATAPATH_WIDTH = 16
 RISCV_DIM_WIDTH = 20
-CTX_ID_WIDTH = 4
 REQUEST_WIDTH = 64
-OPSIZE_MAX = (1 << OPSIZE_WIDTH) - 1
+OPSIZE_MAX = (1 << ISA_OPSIZE_WIDTH) - 1
 INSTR_HEX_WIDTH = (REQUEST_WIDTH + 3) // 4
 SCHEMA = "cent-cosim-jsonl"
 SCHEMA_VERSION = 1
 
+MASK_SEL_ZERO = 0
+MASK_SEL_ALL = 1
+MASK_SEL_ONEHOT_BASE = 2
+MASK_SEL_CTX_BASE = 34
+MASK_CTX_ENTRIES = 30
+
 RISCV = 16
 ISR_SYNC = 17
 ISR_EOC = 18
-SET_CHMASK = 19
+SET_MASK_CTX = 19
+SET_CHMASK = SET_MASK_CTX
+EXP = 20
 RED = 21
 ACC = 22
-SET_RISCV_CTX = 23
+SET_RISCV_PC = 23
+SET_RISCV_CTX = SET_RISCV_PC
 
 PIM_OPCODES = {
     "WR_SBK": 1,
@@ -61,9 +71,11 @@ OPCODES = {
     "RISCV": RISCV,
     "ISR_SYNC": ISR_SYNC,
     "ISR_EOC": ISR_EOC,
+    "SET_MASK_CTX": SET_MASK_CTX,
     "SET_CHMASK": SET_CHMASK,
     "RED": RED,
     "ACC": ACC,
+    "SET_RISCV_PC": SET_RISCV_PC,
     "SET_RISCV_CTX": SET_RISCV_CTX,
 }
 HARDWARE_SUPPORTED_OPS = ["RED", "ACC", "RISCV"]
@@ -144,46 +156,66 @@ def simulate_rmsnorm_scale_bf16(red_scalar_bf16, dim):
     return float_to_bf16_int(scale_f32)
 
 
-def _check_ctx_id(ctx_id):
-    if not 0 <= ctx_id < (1 << CTX_ID_WIDTH):
-        raise ValueError(f"context id must fit in {CTX_ID_WIDTH} bits: {ctx_id}")
+def _check_selector(selector, label="selector"):
+    if not 0 <= selector < (1 << ISA_SELECTOR_WIDTH):
+        raise ValueError(f"{label} must fit in {ISA_SELECTOR_WIDTH} bits: {selector}")
+
+
+def _check_mask_ctx_id(ctx_id):
+    if not 0 <= ctx_id < MASK_CTX_ENTRIES:
+        raise ValueError(f"mask context id must be 0..{MASK_CTX_ENTRIES - 1}: {ctx_id}")
+
+
+def _mask_to_direct_selector(chmask):
+    mask = int(chmask) & 0xFFFFFFFF
+    if mask == 0:
+        return MASK_SEL_ZERO
+    if mask == 0xFFFFFFFF:
+        return MASK_SEL_ALL
+    if mask & (mask - 1) == 0:
+        return MASK_SEL_ONEHOT_BASE + (mask.bit_length() - 1)
+    return None
 
 
 def build_set_chmask(ctx_id, chmask):
-    _check_ctx_id(ctx_id)
+    _check_mask_ctx_id(ctx_id)
     instr = 0
-    instr |= (SET_CHMASK & 0x1F) << 59
-    instr |= (ctx_id & 0xF) << 55
-    instr |= (int(chmask) & 0xFFFFFFFF) << 23
+    instr |= (SET_MASK_CTX & 0x1F) << 59
+    instr |= (ctx_id & 0x3F) << 53
+    instr |= (int(chmask) & 0xFFFFFFFF) << 21
+    return instr
+
+
+def build_set_riscv_pc(pc_id, pc):
+    _check_selector(pc_id, "pc_id")
+    instr = 0
+    instr |= (SET_RISCV_PC & 0x1F) << 59
+    instr |= (pc_id & 0x3F) << 53
+    instr |= (int(pc) & 0xFFFFFFFF) << 21
     return instr
 
 
 def build_set_riscv_ctx(ctx_id, pc, dim):
-    _check_ctx_id(ctx_id)
-    _check_riscv_dim(dim)
-    instr = 0
-    instr |= (SET_RISCV_CTX & 0x1F) << 59
-    instr |= (ctx_id & 0xF) << 55
-    instr |= (int(pc) & 0xFFFFFFFF) << 23
-    instr |= (int(dim) & ((1 << RISCV_DIM_WIDTH) - 1)) << 3
-    return instr
+    del dim
+    return build_set_riscv_pc(ctx_id, pc)
 
 
-def build_raw_instruction(cmd, ch_high=0, ch_low=0, chmask_id=0, opsize=0, bank=0, ro=0, co=0, r1=0):
+def build_raw_instruction(cmd, ch_high=0, ch_low=0, chmask_id=0, mask_sel=None, opsize=0, bank=0, ro=0, co=0, r1=0, flags=0):
+    del ch_high, ch_low
     if not 0 <= opsize <= OPSIZE_MAX:
-        raise ValueError(f"opsize must fit in {OPSIZE_WIDTH} bits: {opsize}")
-    _check_ctx_id(chmask_id)
+        raise ValueError(f"opsize must fit in {ISA_OPSIZE_WIDTH} bits: {opsize}")
+    if mask_sel is None:
+        mask_sel = chmask_id
+    _check_selector(mask_sel, "mask_sel")
     instr = 0
     instr |= (cmd & 0x1F) << 59
-    if cmd & 0x18 == 0x18:
-        instr |= (ch_high & 0xFFFF) << 43
-    else:
-        instr |= (chmask_id & 0xF) << 55
-    instr |= (opsize & OPSIZE_MAX) << 39
-    instr |= (bank & 0xF) << 35
-    instr |= (ro & 0x3FFF) << 21
-    instr |= (co & 0x3FF) << 11
-    instr |= (r1 & 0x7FF)
+    instr |= (mask_sel & 0x3F) << 53
+    instr |= (opsize & OPSIZE_MAX) << 43
+    instr |= (bank & 0xF) << 39
+    instr |= (ro & 0x3FFF) << 25
+    instr |= (co & 0x3FF) << 15
+    instr |= (r1 & 0x7FF) << 4
+    instr |= (flags & 0xF)
     return instr
 
 
@@ -192,30 +224,35 @@ def _check_riscv_dim(dim):
         raise ValueError(f"RISCV dim must fit in {RISCV_DIM_WIDTH} bits: {dim}")
 
 
-def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0, dim=0, ctx_id=0, chmask_id=0):
-    del pc, dim
-    bank = 0
-    ro = r0
-    co = 0
+def build_instruction(cmd, opsize=0, r0=0, r1=0, pc=0, dim=0, ctx_id=0, chmask_id=0, pc_id=None, sub=0, rs2=0):
+    del pc, chmask_id
+    if not 0 <= opsize <= OPSIZE_MAX:
+        raise ValueError(f"opsize must fit in {ISA_OPSIZE_WIDTH} bits: {opsize}")
+    instr = 0
+    instr |= (cmd & 0x1F) << 59
     if cmd == RISCV:
-        _check_ctx_id(ctx_id)
-        chmask_id = ctx_id
-        ro = r0 & 0x7FF
-    instr = build_raw_instruction(
-        cmd,
-        chmask_id=chmask_id,
-        opsize=opsize,
-        bank=bank,
-        ro=ro,
-        co=co,
-        r1=r1,
-    )
+        _check_selector(pc_id if pc_id is not None else ctx_id, "pc_id")
+        _check_riscv_dim(dim)
+        instr |= ((pc_id if pc_id is not None else ctx_id) & 0x3F) << 53
+        instr |= (opsize & OPSIZE_MAX) << 43
+        instr |= (r0 & 0x7FF) << 32
+        instr |= (r1 & 0x7FF) << 21
+        instr |= (int(dim) & ((1 << RISCV_DIM_WIDTH) - 1)) << 1
+    elif cmd in {EXP, RED, ACC}:
+        _check_selector(sub, "sub")
+        instr |= (sub & 0x3F) << 53
+        instr |= (opsize & OPSIZE_MAX) << 43
+        instr |= (r0 & 0x7FF) << 32
+        instr |= (r1 & 0x7FF) << 21
+        instr |= (rs2 & 0x7FF) << 10
+    else:
+        instr |= (opsize & OPSIZE_MAX) << 43
     return instr
 
 
-def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, dim=0, ctx_id=0, case=None, note=None):
+def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, dim=0, pc_id=0, case=None, note=None):
     cmd = OPCODES[op]
-    instr = build_instruction(cmd, opsize=opsize, r0=rd, r1=rs, pc=pc, dim=dim, ctx_id=ctx_id)
+    instr = build_instruction(cmd, opsize=opsize, r0=rd, r1=rs, pc=pc, dim=dim, pc_id=pc_id)
     event = {
         "type": "instruction",
         "op": op,
@@ -229,10 +266,10 @@ def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, dim=0, ctx_id=0, case=None
         },
     }
     if op == "RISCV":
-        event["fields"]["ctx_id"] = ctx_id
+        event["fields"]["pc_id"] = pc_id
         event["fields"]["pc"] = f"0x{pc:08x}"
         event["fields"]["dim"] = dim
-    if op in {"SET_CHMASK", "SET_RISCV_CTX"}:
+    if op in {"SET_MASK_CTX", "SET_CHMASK", "SET_RISCV_PC", "SET_RISCV_CTX"}:
         event["execute"] = "context"
     if case is not None:
         event["case"] = case
@@ -247,29 +284,29 @@ def set_chmask_event(ctx_id, chmask):
     instr = build_set_chmask(ctx_id, chmask)
     return {
         "type": "instruction",
-        "op": "SET_CHMASK",
+        "op": "SET_MASK_CTX",
         "execute": "context",
         "encoded": _hex_instruction(instr),
         "fields": {
-            "cmd": SET_CHMASK,
-            "ctx_id": ctx_id,
+            "cmd": SET_MASK_CTX,
+            "mask_ctx_id": ctx_id,
             "chmask": f"0x{int(chmask) & 0xFFFFFFFF:08x}",
         },
     }
 
 
-def set_riscv_ctx_event(ctx_id, pc, dim):
-    instr = build_set_riscv_ctx(ctx_id, pc, dim)
+def set_riscv_ctx_event(ctx_id, pc, dim=None):
+    del dim
+    instr = build_set_riscv_pc(ctx_id, pc)
     return {
         "type": "instruction",
-        "op": "SET_RISCV_CTX",
+        "op": "SET_RISCV_PC",
         "execute": "context",
         "encoded": _hex_instruction(instr),
         "fields": {
-            "cmd": SET_RISCV_CTX,
-            "ctx_id": ctx_id,
+            "cmd": SET_RISCV_PC,
+            "pc_id": ctx_id,
             "pc": f"0x{int(pc) & 0xFFFFFFFF:08x}",
-            "dim": int(dim),
         },
     }
 
@@ -318,9 +355,9 @@ def _parse_contract_pc(value):
 
 def _add_context_preamble(instruction_events):
     chmask_to_ctx = {}
-    riscv_to_ctx = {}
+    pc_to_id = {}
     next_chmask_ctx = 0
-    next_riscv_ctx = 0
+    next_pc_id = 0
 
     for event in instruction_events:
         if event.get("type") != "instruction":
@@ -328,51 +365,55 @@ def _add_context_preamble(instruction_events):
         fields = event.get("fields", {})
         if event.get("execute") == "noop" and "chmask" in fields:
             chmask = int(fields["chmask"], 0) if isinstance(fields["chmask"], str) else int(fields["chmask"])
-            if chmask not in chmask_to_ctx:
-                if next_chmask_ctx >= (1 << CTX_ID_WIDTH):
-                    raise ValueError("Too many unique channel masks for fixed 64-bit ISA context table")
+            if _mask_to_direct_selector(chmask) is None and chmask not in chmask_to_ctx:
+                if next_chmask_ctx >= MASK_CTX_ENTRIES:
+                    raise ValueError("Too many unique non-direct channel masks for fixed 64-bit ISA mask context table")
                 chmask_to_ctx[chmask] = next_chmask_ctx
                 next_chmask_ctx += 1
         elif event.get("op") == "RISCV":
             pc = _parse_contract_pc(fields.get("pc", 0))
-            dim = int(fields.get("dim", 0))
-            key = (pc, dim)
-            if key not in riscv_to_ctx:
-                if next_riscv_ctx >= (1 << CTX_ID_WIDTH):
-                    raise ValueError("Too many unique RISCV pc/dim pairs for fixed 64-bit ISA context table")
-                riscv_to_ctx[key] = next_riscv_ctx
-                next_riscv_ctx += 1
+            if pc not in pc_to_id:
+                if next_pc_id >= (1 << ISA_SELECTOR_WIDTH):
+                    raise ValueError("Too many unique RISCV PCs for fixed 64-bit ISA PC table")
+                pc_to_id[pc] = next_pc_id
+                next_pc_id += 1
 
     preamble = [
         set_chmask_event(ctx_id, chmask)
         for chmask, ctx_id in chmask_to_ctx.items()
     ]
     preamble.extend(
-        set_riscv_ctx_event(ctx_id, pc, dim)
-        for (pc, dim), ctx_id in riscv_to_ctx.items()
+        set_riscv_ctx_event(pc_id, pc)
+        for pc, pc_id in pc_to_id.items()
     )
 
     for event in instruction_events:
         fields = event.get("fields", {})
         if event.get("execute") == "noop" and "chmask" in fields:
             chmask = int(fields["chmask"], 0) if isinstance(fields["chmask"], str) else int(fields["chmask"])
-            ctx_id = chmask_to_ctx[chmask]
-            fields["ctx_id"] = ctx_id
-            fields["chmask_id"] = ctx_id
+            direct_sel = _mask_to_direct_selector(chmask)
+            if direct_sel is None:
+                ctx_id = chmask_to_ctx[chmask]
+                mask_sel = MASK_SEL_CTX_BASE + ctx_id
+                fields["mask_ctx_id"] = ctx_id
+            else:
+                mask_sel = direct_sel
+            fields["mask_sel"] = mask_sel
             event["encoded"] = _hex_instruction(build_raw_instruction(
                 int(fields["cmd"]),
-                chmask_id=ctx_id,
+                mask_sel=mask_sel,
                 opsize=int(fields.get("opsize", 0)),
                 bank=int(fields.get("bank", 0)),
                 ro=int(fields.get("ro", fields.get("r0", 0))),
                 co=int(fields.get("co", 0)),
-                r1=int(fields.get("r1", 0)),
+                r1=int(fields.get("r1", fields.get("sb", 0))),
+                flags=int(fields.get("flags", 0)),
             ))
         elif event.get("op") == "RISCV":
             pc = _parse_contract_pc(fields.get("pc", 0))
             dim = int(fields.get("dim", 0))
-            ctx_id = riscv_to_ctx[(pc, dim)]
-            fields["ctx_id"] = ctx_id
+            pc_id = pc_to_id[pc]
+            fields["pc_id"] = pc_id
             event["encoded"] = _hex_instruction(build_instruction(
                 RISCV,
                 int(fields.get("opsize", 0)),
@@ -380,7 +421,7 @@ def _add_context_preamble(instruction_events):
                 int(fields.get("r1", 0)),
                 pc=pc,
                 dim=dim,
-                ctx_id=ctx_id,
+                pc_id=pc_id,
             ))
 
     return preamble + instruction_events
@@ -523,11 +564,19 @@ def metadata_event(mode):
         "lanes_per_sb_entry": NUM_LANES,
         "instruction_width_bits": REQUEST_WIDTH,
         "riscv_dim_width_bits": RISCV_DIM_WIDTH,
-        "context_id_width_bits": CTX_ID_WIDTH,
-        "isa_encoding": "fixed64_context_v2",
+        "selector_width_bits": ISA_SELECTOR_WIDTH,
+        "opsize_field_width_bits": ISA_OPSIZE_WIDTH,
+        "opsize_datapath_width_bits": OPSIZE_DATAPATH_WIDTH,
+        "mask_context_entries": MASK_CTX_ENTRIES,
+        "isa_encoding": "fixed64_typed_v3",
         "max_direct_opsize": OPSIZE_MAX,
         "hardware_supported_ops": HARDWARE_SUPPORTED_OPS,
-        "unsupported_pim_policy": "mutate_shared_buffer_from_simulator_event",
+        "unsupported_pim_policy": "live_hardware_conditioned_shared_buffer_mutation",
+        "unsupported_pim_policy_note": (
+            "JSONL carries simulator SB mutation templates; cocotb must rebuild "
+            "later dependent mutations from hardware-produced PNM/RISCV outputs "
+            "before writing them into the RTL shared buffer."
+        ),
     }
 
 
@@ -856,6 +905,7 @@ def generate_single_channel_contract(trace_file):
         ]
         pnm_events = iter(block.cosim_trace_events)
         last_red = None
+        red_source_index = 0
         with legacy_trace.open("r", encoding="utf-8") as legacy:
             for line_no, raw_line in enumerate(legacy, start=1):
                 event = _parse_legacy_trace_line(raw_line, line_no)
@@ -863,6 +913,7 @@ def generate_single_channel_contract(trace_file):
                     continue
 
                 if event.get("op") == "RED":
+                    red_source_index += 1
                     red_record = next(pnm_events, None)
                     if red_record is None or red_record.get("kind") != "RED":
                         raise RuntimeError(f"Missing simulator RED record for legacy line {line_no}")
@@ -871,12 +922,17 @@ def generate_single_channel_contract(trace_file):
                         _sb_write_dict(reg, _bf16_lanes_from_tensor(value), "RED source vector from simulator SB")
                         for reg, value in zip(red_record["src_regs"], red_record["src_values"])
                     ]
-                    events.append(simulate_event(
+                    sim_event = simulate_event(
                         "single_channel",
                         "SB_STATE_BEFORE_RED",
                         writes,
                         "cent_simulator.shared_buffer.RED_inputs",
-                    ))
+                    )
+                    sim_event["red_source_index"] = red_source_index
+                    if red_source_index > 1:
+                        sim_event["requires_live_hardware_state"] = True
+                        sim_event["live_dependency"] = "previous RISCV RMSNorm output"
+                    events.append(sim_event)
 
                     event["fields"].update({
                         "opsize": int(red_record["opsize"]),
@@ -896,17 +952,20 @@ def generate_single_channel_contract(trace_file):
                     events.append(event)
 
                     expected = _bf16_lanes_from_tensor(red_record["result"])
-                    events.append(check_event(
+                    red_check = check_event(
                         "single_channel",
                         int(red_record["rd"]),
                         "scalar_lane0_zero_rest",
                         expected,
                         max_ulp=1,
                         source="RED hardware output",
-                    ))
+                    )
+                    red_check["red_source_index"] = red_source_index
+                    events.append(red_check)
                     last_red = {
                         "rd": int(red_record["rd"]),
                         "expected": expected,
+                        "red_source_index": red_source_index,
                     }
                     continue
 
@@ -958,15 +1017,20 @@ def generate_single_channel_contract(trace_file):
                         "input_lanes_bf16": input_lanes,
                         "expected_lanes_bf16": _bf16_lanes_from_tensor(riscv_record["result"]),
                     }
+                    if last_red is not None:
+                        event["rmsnorm_index"] = last_red["red_source_index"]
                     events.append(event)
-                    events.append(check_event(
+                    riscv_check = check_event(
                         "single_channel",
                         rd,
                         "bf16_broadcast",
                         event["simulator"]["expected_lanes_bf16"],
                         max_ulp=1,
                         source="RISCV RMSNorm scale using explicit dim",
-                    ))
+                    )
+                    if last_red is not None:
+                        riscv_check["rmsnorm_index"] = last_red["red_source_index"]
+                    events.append(riscv_check)
                     last_red = None
                     continue
 

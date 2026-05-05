@@ -127,7 +127,7 @@ class TransformerBlock(PIM, PNM):
                 seqlen = data.shape[-1]
                 shape = data.shape
                 rows_per_seq = (seqlen - 1) // self.DRAM_column + 1
-                rows_per_dim = self.max_seq_len // self.DRAM_column
+                rows_per_dim = (self.max_seq_len - 1) // self.DRAM_column + 1
                 num_heads_per_bank = (self.n_kv_heads - 1) // self.channels_per_block + 1
                 dim_iterations = self.head_dim // self.num_banks
                 for channel in range(self.channels_per_block):
@@ -404,7 +404,7 @@ class TransformerBlock(PIM, PNM):
             if self.intra_device_attention:
                 seqlen = offset
                 rows_per_seq = (seqlen - 1) // self.DRAM_column + 1
-                rows_per_dim = self.max_seq_len // self.DRAM_column
+                rows_per_dim = (self.max_seq_len - 1) // self.DRAM_column + 1
                 num_heads_per_bank = (self.n_kv_heads - 1) // self.channels_per_block + 1
                 for channel in range(self.channels_per_block):
                     if channel == self.channels_per_block - 1:

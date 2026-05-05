@@ -246,8 +246,8 @@ class TransformerBlockLlama(TransformerBlock):
 
             if self.intra_device_attention:   # old V cache mapping, which is not friendly for long context scenario. E.g. seqlen=32k, it stores 32 rows data (1k per row) in each bank, and utilizes 128 banks (8 channels) per head. In Llama2-70B with GQA, only 2 devices (16x32x2=1k banks) can be used. 
                 xv_data = xv_aim.transpose(1, 2).transpose(2, 3)
-                num_rows_per_seq = (seq - 1) // self.DRAM_column + 1
-                rows_per_dim = self.max_seq_len // self.DRAM_column
+                num_rows_per_seq = seq // self.DRAM_column + 1
+                rows_per_dim = (self.max_seq_len - 1) // self.DRAM_column + 1
                 num_heads_per_bank = (self.n_kv_heads - 1) // self.channels_per_block + 1
                 dim_iteration = self.head_dim // self.num_banks
                 for head_index_per_bank in range(num_heads_per_bank):     # each head is distributed into all banks in a channel, each bank contains left_banks heads
@@ -749,9 +749,9 @@ class TransformerBlockLlama(TransformerBlock):
                     self.W_MEM_only_trace(channel_index + tb * channels_required, bank_index, self.cache_k_row_index + seq // self.FC_total_banks * rows + row, self.DRAM_column)
             # Store xv
             if self.intra_device_attention:
-                num_rows_per_seq = (seq - 1) // self.DRAM_column + 1
+                num_rows_per_seq = seq // self.DRAM_column + 1
                 row_offset = num_rows_per_seq - 1
-                rows_per_dim = self.max_seq_len // self.DRAM_column
+                rows_per_dim = (self.max_seq_len - 1) // self.DRAM_column + 1
                 num_heads_per_bank = (self.n_kv_heads - 1) // self.channels_per_block + 1
                 dim_iteration = self.head_dim // self.num_banks
                 for head_index_per_bank in range(num_heads_per_bank):

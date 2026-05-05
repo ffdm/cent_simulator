@@ -80,10 +80,9 @@ def populate_reference_outputs(dic_model):
     values = cache_v[:bsz, :start_pos + seqlen].transpose(1, 2)
     scores = torch.matmul(xq_rot.transpose(1, 2), keys) / math.sqrt(head_dim)
     scores = F.softmax(scores, dim=-1).type_as(xq_rot)
-    # The current single-channel PIM attention-output path is a smoke test and
-    # returns zeroed value-output/WO-projection tensors for this fixture.
-    output = torch.zeros((bsz, seqlen, dim))
-    sa_projection = torch.zeros((bsz, seqlen, dim))
+    output = torch.matmul(scores, values)
+    output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+    sa_projection = F.linear(output, dic_model["wo"])
     h = x + sa_projection
 
     norm_h = RMSNorm(h, dic_model["FFNNorm"])
