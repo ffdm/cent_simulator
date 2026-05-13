@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import sys # FINNPORT
 from aim_sim import PIM
-from pnm_sim import PC_RMSNORM_SCALE
+from pnm_sim import PC_RMSNORM_SCALE, PC_SOFTMAX_EXP_SUM
 from TransformerBlock import TransformerBlock
 from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
 
@@ -15,6 +15,63 @@ class TransformerBlockLlama(TransformerBlock):
     """
     def __init__(self, dic_model, args):
         super().__init__(dic_model, args)
+
+    def _score_chunks_for_head(self, scores_head):
+        scores_flat = scores_head.reshape(-1).to(torch.bfloat16)
+        pad = (-scores_flat.numel()) % 16
+        if pad:
+            scores_flat = torch.cat((
+                scores_flat,
+                torch.full((pad,), float("-inf"), dtype=scores_flat.dtype),
+            ))
+        return [scores_flat[index:index + 16].clone() for index in range(0, scores_flat.numel(), 16)]
+
+    def _write_score_chunks_to_sb(self, chunks, base_reg):
+        if base_reg + len(chunks) > self.shared_buffer.num_registers:
+            raise RuntimeError(
+                f"PNM softmax needs SB[{base_reg}..{base_reg + len(chunks) - 1}], "
+                f"but the functional shared buffer has {self.shared_buffer.num_registers} registers"
+            )
+        for index, chunk in enumerate(chunks):
+            self.shared_buffer.registers[base_reg + index] = chunk.to(torch.bfloat16)
+
+    def _read_score_chunks_from_sb(self, base_reg, seqlen):
+        chunk_count = (seqlen + 15) // 16
+        chunks = [self.shared_buffer.registers[base_reg + index] for index in range(chunk_count)]
+        return torch.cat(chunks)[:seqlen]
+
+    def _pnm_softmax_one_head(self, scores_head, score_base=0, exp_base=256):
+        seqlen = scores_head.numel()
+        chunks = self._score_chunks_for_head(scores_head)
+        chunk_count = len(chunks)
+        if exp_base + chunk_count > self.shared_buffer.num_registers:
+            raise RuntimeError(
+                f"PNM softmax EXP destination SB[{exp_base}..{exp_base + chunk_count - 1}] "
+                f"does not fit in {self.shared_buffer.num_registers} registers"
+            )
+        if score_base + chunk_count > exp_base and score_base < exp_base + chunk_count:
+            raise RuntimeError("PNM softmax score and exp SB windows overlap")
+
+        self._write_score_chunks_to_sb(chunks, score_base)
+        self.EXP(chunk_count, exp_base, score_base)
+        self.RED(chunk_count, score_base, exp_base)
+        self.RISCV(1, PC_SOFTMAX_EXP_SUM, score_base + 1, score_base)
+
+        exp_scores = self._read_score_chunks_from_sb(exp_base, seqlen).reshape(scores_head.shape)
+        reciprocal = self.shared_buffer.registers[score_base + 1][0].item()
+        reciprocal_scores = torch.full(scores_head.shape, reciprocal, dtype=torch.bfloat16)
+        return exp_scores, reciprocal_scores
+
+    def _pnm_softmax(self, scores):
+        exp_heads = []
+        reciprocal_heads = []
+        for head in range(self.n_heads):
+            exp_head, reciprocal_head = self._pnm_softmax_one_head(scores[0][head][0])
+            exp_heads.append(exp_head)
+            reciprocal_heads.append(reciprocal_head)
+        scores_exp = torch.stack(exp_heads).reshape(1, self.n_heads, 1, -1)
+        scores_exp_sum_reciprocal = torch.stack(reciprocal_heads).reshape(1, self.n_heads, 1, -1)
+        return scores_exp, scores_exp_sum_reciprocal
         
     def precision_test(self):
         # Results are different in BFloat16 in 7B
@@ -199,6 +256,40 @@ class TransformerBlockLlama(TransformerBlock):
         xv_aim = xv_aim.reshape(bsz, 1, self.n_kv_heads, self.head_dim)
 
         xq_aim, xk_aim = apply_rotary_emb(xq_aim, xk_aim, self.freqs_cis)
+        xq_rope_aim = xq_aim
+        q_scale = 1.0 / math.sqrt(self.head_dim)
+
+        if self.score_scale_placement == "prescale-q":
+            if self.pim_compute:
+                xq_flat = xq_rope_aim.reshape(-1)
+                q_scale_tensor = torch.full(xq_flat.shape, q_scale, dtype=xq_flat.dtype)
+                q_bank_group_shape = self.store_to_DRAM_multi_channel(
+                    xq_flat,
+                    self.xq_row_index,
+                    "vector_bank_group_0",
+                    self.trace_attention,
+                )
+                self.store_to_DRAM_multi_channel(
+                    q_scale_tensor,
+                    self.xq_row_index,
+                    "vector_bank_group_1",
+                    self.trace_attention,
+                )
+                q_prescale_op_size = (q_bank_group_shape[0] - 1) // self.burst_length + 1
+                for channel in channel_lst:
+                    op_trace = channel == 0 and self.trace_attention
+                    self.EWMUL(0, channel, channels_required, self.xq_row_index, 0, q_prescale_op_size, op_trace)
+                xq_score_aim = self.load_from_DRAM_multi_channel(
+                    torch.Size([xq_flat.numel()]),
+                    self.xq_row_index,
+                    "vector_bank_group_2",
+                    q_bank_group_shape[0],
+                    False,
+                ).reshape(xq_rope_aim.shape)
+            else:
+                xq_score_aim = (xq_rope_aim.float() * q_scale).to(xq_rope_aim.dtype)
+        else:
+            xq_score_aim = xq_rope_aim
 
         if self.trace_fc_kqvo:
             input_vector_EWMUL_length = (self.dim - 1) // (self.total_banks // 4) + 1
@@ -217,20 +308,29 @@ class TransformerBlockLlama(TransformerBlock):
             self.time["RD_SBK"] += self.timing_constant["RD_SBK"] + self.dim * 2 // self.burst_length
             self.store_for_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.xk_row_index, input_vector_EWMUL_length // self.n_repeat * 2)
 
-        self.dic_shape["xq"] = self.store_to_DRAM_multi_channel(xq_aim.reshape(-1), self.xq_row_index, self.mode["vector"], False)
+            if self.score_scale_placement == "prescale-q":
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.dim // self.burst_length
+                self.store_for_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 0, self.xq_row_index, input_vector_EWMUL_length)
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.dim // self.burst_length
+                self.store_for_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 1, self.xq_row_index, input_vector_EWMUL_length)
+                self.EWMUL_only_trace(channel_lst, self.xq_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+                self.time["RD_SBK"] += self.timing_constant["RD_SBK"] + self.dim // self.burst_length
+                self.load_from_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.xq_row_index, input_vector_EWMUL_length)
+
+        self.dic_shape["xq"] = self.store_to_DRAM_multi_channel(xq_score_aim.reshape(-1), self.xq_row_index, self.mode["vector"], False)
 
         # CXL Ports     Store xq
         if self.pim_compute:
-            self.broadcast_store_query(channels_required, self.xq_row_index, xq_aim.reshape(-1), False)
+            self.broadcast_store_query(channels_required, self.xq_row_index, xq_score_aim.reshape(-1), False)
             xq_aim_loaded = {}
             self.broadcast_load_query(xq_aim_loaded, channels_required, self.xq_row_index)
             print()
             for channel in channel_lst:
-                compare(xq_aim.reshape(-1), xq_aim_loaded[channel], "xq_aim_loaded channel "+str(channel))
+                compare(xq_score_aim.reshape(-1), xq_aim_loaded[channel], "xq_aim_loaded channel "+str(channel))
         else:
             xq_aim_load = self.load_from_DRAM_multi_channel(self.xq.shape, self.xq_row_index, self.mode["vector"], self.dic_shape["xq"][0], False)
             xq_aim_load = xq_aim_load.reshape(bsz, 1, self.n_heads, self.head_dim)
-            compare(xq_aim_load[0][0], xq_aim[0][0], "xq_aim_load")
+            compare(xq_aim_load[0][0], xq_score_aim[0][0], "xq_aim_load")
 
         # CXL Ports     Store xk xv
         if self.pim_compute:
@@ -340,9 +440,14 @@ class TransformerBlockLlama(TransformerBlock):
                 if self.GQA:
                     keys = repeat_kv(keys, self.n_repeat)
                     values = repeat_kv(values, self.n_repeat)
-                xq = xq_aim.transpose(1, 2)
+                xq_rope = xq_rope_aim.transpose(1, 2)
+                xq_score = xq_score_aim.transpose(1, 2)
                 keys = keys.transpose(1, 2).transpose(2, 3)
-                compare(scores_aim, torch.matmul(xq, keys), "Vector_Matrix_Mul score")
+                if self.score_scale_placement == "prescale-q":
+                    post_scaled_scores = torch.matmul(xq_rope, keys) * q_scale
+                    compare(scores_aim, post_scaled_scores, "Vector_Matrix_Mul score prescaled-Q")
+                else:
+                    compare(scores_aim, torch.matmul(xq_score, keys), "Vector_Matrix_Mul score")
         else:
             scores_aim = []
             for i in range(self.n_heads):
@@ -350,41 +455,52 @@ class TransformerBlockLlama(TransformerBlock):
             scores_aim = torch.tensor(scores_aim).reshape(bsz, self.n_heads, 1, -1)
 
         # CXL Ports
-        head_dim_reciprocal = torch.full(scores_aim.shape, 1 / math.sqrt(self.head_dim))
-        self.store_to_DRAM_multi_channel(scores_aim.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_0", self.trace_attention)
-        self.store_to_DRAM_multi_channel(head_dim_reciprocal.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_1", self.trace_attention)
-        for channel in channel_lst:
-            self.time["WR_SBK"] += (self.timing_constant["WR_SBK"] + 4096 // self.burst_length) * 16 // 2    # 16 rows for 4k seq length, but use 16 // 2 for average
-            self.time["WR_SBK"] += (self.timing_constant["WR_SBK"] + 4096 // self.burst_length) * 16 // 2    # 16 rows for 4k seq length, but use 16 // 2 for average
-
-        # AiM EWMUL
-        if self.pim_compute:
-            rows_per_score = (seqlen - 1) // self.DRAM_column + 1
-            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
+        if self.score_scale_placement == "post-scale-scores":
+            head_dim_reciprocal = torch.full(scores_aim.shape, q_scale)
+            self.store_to_DRAM_multi_channel(scores_aim.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_0", self.trace_attention)
+            self.store_to_DRAM_multi_channel(head_dim_reciprocal.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_1", self.trace_attention)
             for channel in channel_lst:
-                op_trace = channel == 0 and self.trace_attention
-                for score_index in range(num_scores_per_bank):
-                    for row in range(rows_per_score):
-                        if row == rows_per_score - 1:
-                            offset = seqlen - row * self.DRAM_column
-                        else:
-                            offset = self.DRAM_column
-                        self.EWMUL(0, channel, channels_required, self.scores_row_index + score_index * rows_per_score + row, 0, (offset - 1) // self.burst_length + 1, op_trace)
+                self.time["WR_SBK"] += (self.timing_constant["WR_SBK"] + 4096 // self.burst_length) * 16 // 2    # 16 rows for 4k seq length, but use 16 // 2 for average
+                self.time["WR_SBK"] += (self.timing_constant["WR_SBK"] + 4096 // self.burst_length) * 16 // 2    # 16 rows for 4k seq length, but use 16 // 2 for average
+
+            # AiM EWMUL
+            if self.pim_compute:
+                rows_per_score = (seqlen - 1) // self.DRAM_column + 1
+                num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
+                for channel in channel_lst:
+                    op_trace = channel == 0 and self.trace_attention
+                    for score_index in range(num_scores_per_bank):
+                        for row in range(rows_per_score):
+                            if row == rows_per_score - 1:
+                                offset = seqlen - row * self.DRAM_column
+                            else:
+                                offset = self.DRAM_column
+                            self.EWMUL(0, channel, channels_required, self.scores_row_index + score_index * rows_per_score + row, 0, (offset - 1) // self.burst_length + 1, op_trace)
+            else:
+                scores_aim_load = self.load_from_DRAM_multi_channel(self.scores.shape, self.scores_row_index, "scores_bank_group_0", seqlen, False)
+                head_dim_reciprocal_load = self.load_from_DRAM_multi_channel(self.scores.shape, self.scores_row_index, "scores_bank_group_1", seqlen, False)
+                scores_aim = self.Vector_Vector_EWMUL(scores_aim_load, head_dim_reciprocal_load)
+                self.store_to_DRAM_multi_channel(scores_aim.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_2", False)
         else:
-            scores_aim_load = self.load_from_DRAM_multi_channel(self.scores.shape, self.scores_row_index, "scores_bank_group_0", seqlen, False)
-            head_dim_reciprocal_load = self.load_from_DRAM_multi_channel(self.scores.shape, self.scores_row_index, "scores_bank_group_1", seqlen, False)
-            scores_aim = self.Vector_Vector_EWMUL(scores_aim_load, head_dim_reciprocal_load)
-            self.store_to_DRAM_multi_channel(scores_aim.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_2", False)
+            self.store_to_DRAM_multi_channel(scores_aim.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_2", self.trace_attention)
 
         # CXL Ports
         scores_aim = self.load_from_DRAM_multi_channel(self.scores.shape, self.scores_row_index, "scores_bank_group_2", seqlen, self.trace_attention)
         if self.pim_compute and debug:
-            scores = torch.matmul(xq, keys) / math.sqrt(self.head_dim)
+            scores = torch.matmul(xq_rope, keys) * q_scale
             compare(scores_aim, scores, "Vector_Matrix_Mul score / head_dim")
 
-        scores_exp = torch.exp(scores_aim)
-        scores_exp_sum_reciprocal = 1 / torch.sum(scores_exp, dim=-1, keepdim=True)
-        scores_exp_sum_reciprocal = torch.cat([scores_exp_sum_reciprocal for i in range(scores_exp.shape[-1])], dim=-1)
+        if self.softmax_impl == "pnm-functional":
+            scores_exp, scores_exp_sum_reciprocal = self._pnm_softmax(scores_aim)
+            compare(
+                (scores_exp.float() * scores_exp_sum_reciprocal.float()).to(scores_aim.dtype),
+                torch.softmax(scores_aim, dim=-1).to(scores_aim.dtype),
+                "PNM functional softmax",
+            )
+        else:
+            scores_exp = torch.exp(scores_aim)
+            scores_exp_sum_reciprocal = 1 / torch.sum(scores_exp, dim=-1, keepdim=True)
+            scores_exp_sum_reciprocal = torch.cat([scores_exp_sum_reciprocal for i in range(scores_exp.shape[-1])], dim=-1)
         self.store_to_DRAM_multi_channel(scores_exp.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_0", self.trace_attention)
         self.store_to_DRAM_multi_channel(scores_exp_sum_reciprocal.reshape(self.n_heads, -1), self.scores_row_index, "scores_bank_group_1", self.trace_attention)
         for channel in range(channels_required):
@@ -812,27 +928,28 @@ class TransformerBlockLlama(TransformerBlock):
         #     self.SYNC_only_trace()
 
         # if False:
-            # CXL Port write scale
             rows_per_score = (seqlen - 1) // self.DRAM_column + 1
-            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
-            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, seqlen)
-            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
-            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, seqlen)
-
-            # Scale score
             num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
-            for score_index in range(num_scores_per_bank):
-                for row in range(rows_per_score):
-                    if row == rows_per_score - 1:
-                        offset = seqlen - row * self.DRAM_column
-                    else:
-                        offset = self.DRAM_column
-                    self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
-            
-            # CXL Port write mean of sum(exp)
-            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
-            self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, seqlen)
-            self.SYNC_only_trace()
+            if self.score_scale_placement == "post-scale-scores":
+                # CXL Port write scale
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, seqlen)
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, seqlen)
+
+                # Scale score
+                for score_index in range(num_scores_per_bank):
+                    for row in range(rows_per_score):
+                        if row == rows_per_score - 1:
+                            offset = seqlen - row * self.DRAM_column
+                        else:
+                            offset = self.DRAM_column
+                        self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+
+                # CXL Port write mean of sum(exp)
+                self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+                self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, seqlen)
+                self.SYNC_only_trace()
             self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
             self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, seqlen)
             self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length

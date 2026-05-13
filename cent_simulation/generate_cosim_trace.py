@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from pnm_sim import PC_RMSNORM_SCALE
+from pnm_sim import PC_RMSNORM_SCALE, PC_SOFTMAX_EXP_SUM
 
 NUM_LANES = 16
 ISA_SELECTOR_WIDTH = 6
@@ -73,12 +73,13 @@ OPCODES = {
     "ISR_EOC": ISR_EOC,
     "SET_MASK_CTX": SET_MASK_CTX,
     "SET_CHMASK": SET_CHMASK,
+    "EXP": EXP,
     "RED": RED,
     "ACC": ACC,
     "SET_RISCV_PC": SET_RISCV_PC,
     "SET_RISCV_CTX": SET_RISCV_CTX,
 }
-HARDWARE_SUPPORTED_OPS = ["RED", "ACC", "RISCV"]
+HARDWARE_SUPPORTED_OPS = ["EXP", "RED", "ACC", "RISCV"]
 
 
 def float_to_bf16_int(value):
@@ -256,7 +257,7 @@ def instruction_event(op, opsize=0, rd=0, rs=0, pc=0, dim=0, pc_id=0, case=None,
     event = {
         "type": "instruction",
         "op": op,
-        "execute": "control" if op == "ISR_EOC" else "hardware",
+        "execute": "control" if op in {"ISR_EOC", "ISR_SYNC"} else "hardware",
         "encoded": f"0x{instr:0{INSTR_HEX_WIDTH}x}",
         "fields": {
             "cmd": cmd,
@@ -649,10 +650,11 @@ def generate_rmsnorm_contract(trace_file, opsize=4, seed=123, include_random=Tru
     return trace_file
 
 
-def _single_channel_args(trace_file):
+def _single_channel_args(trace_file, softmax_impl="python", context_len=1):
     class Args:
         pass
 
+    context_len = int(context_len)
     args = Args()
     args.pim_compute = True
     args.op_trace = True
@@ -675,7 +677,7 @@ def _single_channel_args(trace_file):
     args.num_channels = 1
     args.GEMV = "no-reuse"
     args.reuse_size = 2
-    args.max_seq_len = 1
+    args.max_seq_len = context_len
     args.inter_device_attention = False
     args.DRAM_column = 1024
     args.DRAM_row = 1024 * 16
@@ -683,6 +685,8 @@ def _single_channel_args(trace_file):
     args.num_banks = 16
     args.threads = 1
     args.trace_file = str(trace_file)
+    args.score_scale_placement = "prescale-q"
+    args.softmax_impl = softmax_impl
     return args
 
 
@@ -825,6 +829,16 @@ def _parse_legacy_trace_line(raw_line, line_no):
             event["encoded"] = _hex_instruction(build_instruction(RED, opsize, rd, rs))
         else:
             event["reason"] = "opsize_exceeds_decoder_field"
+    elif op == "PNM_EXP" and len(parts) == 4:
+        opsize = int(parts[1], 0)
+        event.update({"op": "EXP", "execute": "hardware"})
+        rd = int(parts[2], 0)
+        rs = int(parts[3], 0)
+        event["fields"] = {"cmd": EXP, "opsize": opsize, "r0": rd, "r1": rs}
+        if opsize <= OPSIZE_MAX:
+            event["encoded"] = _hex_instruction(build_instruction(EXP, opsize, rd, rs))
+        else:
+            event["reason"] = "opsize_exceeds_decoder_field"
     elif op == "PNM_ACC" and len(parts) == 5:
         opsize = int(parts[1], 0)
         rd = int(parts[2], 0)
@@ -841,8 +855,15 @@ def _parse_legacy_trace_line(raw_line, line_no):
         pc = int(parts[2], 0)
         rd = int(parts[3], 0)
         rs = int(parts[4], 0)
-        dim = legacy_opsize * NUM_LANES
-        riscv_opsize = 1 if pc == PC_RMSNORM_SCALE else legacy_opsize
+        if pc == PC_RMSNORM_SCALE:
+            dim = legacy_opsize * NUM_LANES
+            riscv_opsize = 1
+        elif pc == PC_SOFTMAX_EXP_SUM:
+            dim = 0
+            riscv_opsize = 1
+        else:
+            dim = 0
+            riscv_opsize = legacy_opsize
         event.update({"op": "RISCV", "execute": "hardware"})
         event["fields"] = {
             "cmd": RISCV,
@@ -868,9 +889,16 @@ def _parse_legacy_trace_line(raw_line, line_no):
     return event
 
 
-def generate_single_channel_contract(trace_file):
+def generate_single_channel_contract(trace_file, softmax_impl="python", context_len=1, fixture_mode=None):
     trace_file = Path(trace_file)
     trace_file.parent.mkdir(parents=True, exist_ok=True)
+    context_len = int(context_len)
+    if softmax_impl == "pnm-functional" and context_len % NUM_LANES != 0:
+        raise ValueError(
+            "pnm-functional hardware softmax requires a context length that is "
+            f"a multiple of {NUM_LANES} lanes; got {context_len}. The current "
+            "EXP/RED hardware has no per-lane valid mask for padded score lanes."
+        )
 
     with tempfile.NamedTemporaryFile("w+", suffix=".legacy.trace", delete=False) as tmp:
         legacy_trace = Path(tmp.name)
@@ -879,8 +907,12 @@ def generate_single_channel_contract(trace_file):
         from Llama import TransformerBlockLlama
         from test_single_channel import get_test_inputs
 
-        dic_model = get_test_inputs()
-        args = _single_channel_args(legacy_trace)
+        dic_model = get_test_inputs(context_len=context_len, fixture_mode=fixture_mode)
+        args = _single_channel_args(
+            legacy_trace,
+            softmax_impl=softmax_impl,
+            context_len=context_len,
+        )
         block = TransformerBlockLlama(dic_model, args)
         block.cosim_trace_events = []
         block.memory_mapping()
@@ -904,35 +936,98 @@ def generate_single_channel_contract(trace_file):
             },
         ]
         pnm_events = iter(block.cosim_trace_events)
+        events[0]["softmax_impl"] = softmax_impl
+        events[0]["context_len"] = context_len
+        events[0]["fixture_mode"] = dic_model.get("fixture_mode", "legacy")
         last_red = None
+        last_exp = None
         red_source_index = 0
+        softmax_head_index = 0
         with legacy_trace.open("r", encoding="utf-8") as legacy:
             for line_no, raw_line in enumerate(legacy, start=1):
                 event = _parse_legacy_trace_line(raw_line, line_no)
                 if not event:
                     continue
 
+                if event.get("op") == "EXP":
+                    exp_record = next(pnm_events, None)
+                    if exp_record is None or exp_record.get("kind") != "EXP":
+                        raise RuntimeError(f"Missing simulator EXP record for legacy line {line_no}")
+
+                    head_index = softmax_head_index
+                    softmax_head_index += 1
+                    writes = [
+                        _sb_write_dict(reg, _bf16_lanes_from_tensor(value), "EXP source vector from simulator SB")
+                        for reg, value in zip(exp_record["src_regs"], exp_record["src_values"])
+                    ]
+                    sim_event = simulate_event(
+                        "single_channel",
+                        "SB_STATE_BEFORE_EXP",
+                        writes,
+                        "cent_simulator.shared_buffer.EXP_inputs",
+                    )
+                    sim_event["softmax_head_index"] = head_index
+                    sim_event["requires_live_hardware_state"] = True
+                    sim_event["live_dependency"] = "previous RISCV RMSNorm output"
+                    events.append(sim_event)
+
+                    event["fields"].update({
+                        "opsize": int(exp_record["opsize"]),
+                        "r0": int(exp_record["rd"]),
+                        "r1": int(exp_record["rs"]),
+                    })
+                    event["encoded"] = _hex_instruction(build_instruction(
+                        EXP,
+                        int(exp_record["opsize"]),
+                        int(exp_record["rd"]),
+                        int(exp_record["rs"]),
+                    ))
+                    event["simulator"] = {
+                        "source_register_count": len(exp_record["src_regs"]),
+                        "source_registers": [int(reg) for reg in exp_record["src_regs"]],
+                        "destination_registers": [int(reg) for reg in exp_record["dst_regs"]],
+                    }
+                    event["softmax_head_index"] = head_index
+                    events.append(event)
+                    last_exp = {
+                        "rd": int(exp_record["rd"]),
+                        "dst_regs": [int(reg) for reg in exp_record["dst_regs"]],
+                        "softmax_head_index": head_index,
+                    }
+                    continue
+
                 if event.get("op") == "RED":
-                    red_source_index += 1
                     red_record = next(pnm_events, None)
                     if red_record is None or red_record.get("kind") != "RED":
                         raise RuntimeError(f"Missing simulator RED record for legacy line {line_no}")
 
-                    writes = [
-                        _sb_write_dict(reg, _bf16_lanes_from_tensor(value), "RED source vector from simulator SB")
-                        for reg, value in zip(red_record["src_regs"], red_record["src_values"])
-                    ]
-                    sim_event = simulate_event(
-                        "single_channel",
-                        "SB_STATE_BEFORE_RED",
-                        writes,
-                        "cent_simulator.shared_buffer.RED_inputs",
+                    src_regs = [int(reg) for reg in red_record["src_regs"]]
+                    exp_handoff = (
+                        last_exp is not None
+                        and src_regs[:len(last_exp["dst_regs"])] == last_exp["dst_regs"]
                     )
-                    sim_event["red_source_index"] = red_source_index
-                    if red_source_index > 1:
-                        sim_event["requires_live_hardware_state"] = True
-                        sim_event["live_dependency"] = "previous RISCV RMSNorm output"
-                    events.append(sim_event)
+                    head_index = last_exp["softmax_head_index"] if exp_handoff else None
+
+                    if exp_handoff:
+                        event["handoff"] = "red_reads_previous_exp_destination"
+                        event["softmax_head_index"] = head_index
+                    else:
+                        red_source_index += 1
+                        writes = [
+                            _sb_write_dict(reg, _bf16_lanes_from_tensor(value), "RED source vector from simulator SB")
+                            for reg, value in zip(red_record["src_regs"], red_record["src_values"])
+                        ]
+                        sim_event = simulate_event(
+                            "single_channel",
+                            "SB_STATE_BEFORE_RED",
+                            writes,
+                            "cent_simulator.shared_buffer.RED_inputs",
+                        )
+                        sim_event["red_source_index"] = red_source_index
+                        if red_source_index > 1:
+                            sim_event["requires_live_hardware_state"] = True
+                            sim_event["live_dependency"] = "previous RISCV RMSNorm output"
+                        events.append(sim_event)
 
                     event["fields"].update({
                         "opsize": int(red_record["opsize"]),
@@ -947,26 +1042,35 @@ def generate_single_channel_contract(trace_file):
                     ))
                     event["simulator"] = {
                         "source_register_count": len(red_record["src_regs"]),
-                        "source_registers": [int(reg) for reg in red_record["src_regs"]],
+                        "source_registers": src_regs,
                     }
                     events.append(event)
 
                     expected = _bf16_lanes_from_tensor(red_record["result"])
+                    if exp_handoff:
+                        source = "RED Softmax exp sum"
+                    else:
+                        source = "RED hardware output"
                     red_check = check_event(
                         "single_channel",
                         int(red_record["rd"]),
                         "scalar_lane0_zero_rest",
                         expected,
                         max_ulp=1,
-                        source="RED hardware output",
+                        source=source,
                     )
-                    red_check["red_source_index"] = red_source_index
+                    if exp_handoff:
+                        red_check["softmax_head_index"] = head_index
+                    else:
+                        red_check["red_source_index"] = red_source_index
                     events.append(red_check)
                     last_red = {
                         "rd": int(red_record["rd"]),
                         "expected": expected,
-                        "red_source_index": red_source_index,
+                        "red_source_index": None if exp_handoff else red_source_index,
+                        "softmax_head_index": head_index,
                     }
+                    last_exp = None
                     continue
 
                 if event.get("op") == "RISCV":
@@ -1017,20 +1121,36 @@ def generate_single_channel_contract(trace_file):
                         "input_lanes_bf16": input_lanes,
                         "expected_lanes_bf16": _bf16_lanes_from_tensor(riscv_record["result"]),
                     }
-                    if last_red is not None:
+                    if pc == PC_RMSNORM_SCALE and last_red is not None:
                         event["rmsnorm_index"] = last_red["red_source_index"]
+                    elif pc == PC_SOFTMAX_EXP_SUM and last_red is not None:
+                        event["softmax_head_index"] = last_red["softmax_head_index"]
                     events.append(event)
+                    if pc == PC_SOFTMAX_EXP_SUM:
+                        source = "RISCV Softmax reciprocal"
+                    elif pc == PC_RMSNORM_SCALE:
+                        source = "RISCV RMSNorm scale using explicit dim"
+                    else:
+                        source = "RISCV hardware output"
                     riscv_check = check_event(
                         "single_channel",
                         rd,
                         "bf16_broadcast",
                         event["simulator"]["expected_lanes_bf16"],
                         max_ulp=1,
-                        source="RISCV RMSNorm scale using explicit dim",
+                        source=source,
                     )
-                    if last_red is not None:
+                    if pc == PC_RMSNORM_SCALE and last_red is not None:
                         riscv_check["rmsnorm_index"] = last_red["red_source_index"]
+                    elif pc == PC_SOFTMAX_EXP_SUM and last_red is not None:
+                        riscv_check["softmax_head_index"] = last_red["softmax_head_index"]
                     events.append(riscv_check)
+                    if pc == PC_SOFTMAX_EXP_SUM:
+                        events.append(instruction_event(
+                            "ISR_SYNC",
+                            case="single_channel",
+                            note="pause SRAM-mode replay after softmax reciprocal so the next live EXP-input mutation can be applied safely",
+                        ))
                     last_red = None
                     continue
 
@@ -1074,6 +1194,11 @@ def generate_single_channel_contract(trace_file):
         events[0]["mutation_event_count"] = sum(
             1 for event in events if event.get("type") in {"simulate", "sb_write"}
         )
+        hardware_op_counts = {}
+        for event in instruction_events:
+            if event.get("execute") == "hardware":
+                hardware_op_counts[event.get("op")] = hardware_op_counts.get(event.get("op"), 0) + 1
+        events[0]["hardware_op_counts"] = hardware_op_counts
 
         with trace_file.open("w", encoding="utf-8") as output:
             for event in events:
@@ -1100,6 +1225,23 @@ def main():
     parser.add_argument("--seed", type=int, default=123, help="Random RMSNorm case seed")
     parser.add_argument("--no-random", action="store_true", help="Omit random RMSNorm case")
     parser.add_argument("--no-simulator", action="store_true", help="Omit simulator tensor RMSNorm case")
+    parser.add_argument(
+        "--softmax-impl",
+        choices=["python", "pnm-functional"],
+        default=os.getenv("SINGLE_CHANNEL_COSIM_SOFTMAX_IMPL", "python"),
+        help="Single-channel softmax implementation to emit",
+    )
+    parser.add_argument(
+        "--context-len",
+        type=int,
+        default=int(os.getenv("SINGLE_CHANNEL_COSIM_CONTEXT_LEN", "1")),
+        help="Single-channel attention context length",
+    )
+    parser.add_argument(
+        "--fixture-mode",
+        default=os.getenv("SINGLE_CHANNEL_COSIM_FIXTURE_MODE", "auto"),
+        help="Single-channel fixture mode: auto, legacy, prompt-random, or synthetic-prompt",
+    )
     args = parser.parse_args()
 
     if args.mode == "rmsnorm":
@@ -1111,7 +1253,12 @@ def main():
             include_simulator=not args.no_simulator,
         )
     else:
-        path = generate_single_channel_contract(args.trace_file)
+        path = generate_single_channel_contract(
+            args.trace_file,
+            softmax_impl=args.softmax_impl,
+            context_len=args.context_len,
+            fixture_mode=args.fixture_mode,
+        )
     print(path)
 
 

@@ -41,6 +41,12 @@ class TransformerBlock(PIM, PNM):
         self.only_trace = args.only_trace
         self.model_parallel = args.model_parallel
         self.pipeline_parallel = args.pipeline_parallel
+        self.score_scale_placement = getattr(args, "score_scale_placement", "prescale-q")
+        self.softmax_impl = getattr(args, "softmax_impl", "python")
+        if self.score_scale_placement not in {"post-scale-scores", "prescale-q"}:
+            raise ValueError(f"Unsupported score scale placement: {self.score_scale_placement}")
+        if self.softmax_impl not in {"python", "pnm-functional"}:
+            raise ValueError(f"Unsupported softmax implementation: {self.softmax_impl}")
         if args.channels_per_block:
             self.channels_per_block = args.channels_per_block
         else:
@@ -100,7 +106,7 @@ class TransformerBlock(PIM, PNM):
         else:
             self.FC_total_banks = self.total_banks
             self.intra_device_attention = True
-        self.shared_buffer = SharedBuffer(256)
+        self.shared_buffer = SharedBuffer(512)
 
     def bank_index(self, index):
         # look for the bank to store a head
@@ -366,10 +372,12 @@ class TransformerBlock(PIM, PNM):
                                     head = (bank // 4) * num_heads_per_bank + j
                                     if head > self.n_heads - 1:
                                         break
+                                    start = k * self.DRAM_column + burst * self.burst_length
                                     if burst < bursts_per_bank - 1:
-                                        data_bank = data[head][k * self.DRAM_column + burst * self.burst_length : k * self.DRAM_column + (burst + 1) * self.burst_length]
+                                        stop = start + self.burst_length
                                     else:
-                                        data_bank = data[head][k * self.DRAM_column + burst * self.burst_length :]
+                                        stop = k * self.DRAM_column + bank_dim
+                                    data_bank = data[head][start:stop]
                                     self.store_to_DRAM_single_bank(dimm_index, channel_index, bank_index, row_index + j * rows_per_score + k, burst * self.burst_length, data_bank.shape[0], data_bank, op_trace)
 
                 # for i in range(self.total_banks):

@@ -64,55 +64,38 @@ class PNM:
             self.file.write(f"PNM_ACC {opsize} {rd_val} {rs1_val} {rs2_val}\n")
 
     def EXP(self, opsize, rd, rs):
+        cosim_event = None
         if not self.only_trace:
-            if isinstance(rs, list) and isinstance(rd, list):
-                for i in range(opsize):
-                    self.shared_buffer.registers[rd[i]] = torch.exp(self.shared_buffer.registers[rs[i]])
+            if isinstance(rs, list):
+                src_regs = rs[:opsize]
             else:
-                self.shared_buffer.registers[rd] = torch.exp(self.shared_buffer.registers[rs])
+                src_regs = [rs + i for i in range(opsize)]
+            if isinstance(rd, list):
+                dst_regs = rd[:opsize]
+            else:
+                dst_regs = [rd + i for i in range(opsize)]
+
+            src_values = [self.shared_buffer.registers[r].clone() for r in src_regs]
+            for dst_reg, src_reg in zip(dst_regs, src_regs):
+                self.shared_buffer.registers[dst_reg] = torch.exp(self.shared_buffer.registers[src_reg])
+            cosim_event = {
+                "kind": "EXP",
+                "opsize": opsize,
+                "rd": dst_regs[0] if dst_regs else (rd[0] if isinstance(rd, list) else rd),
+                "rs": src_regs[0] if src_regs else (rs[0] if isinstance(rs, list) else rs),
+                "dst_regs": dst_regs,
+                "src_regs": src_regs,
+                "src_values": src_values,
+                "result_values": [self.shared_buffer.registers[r].clone() for r in dst_regs],
+            }
+
+        if cosim_event is not None and hasattr(self, "cosim_trace_events"):
+            self.cosim_trace_events.append(cosim_event)
             
         if self.op_trace:
             rs_val = rs[0] if isinstance(rs, list) else rs
             rd_val = rd[0] if isinstance(rd, list) else rd
             self.file.write(f"PNM_EXP {opsize} {rd_val} {rs_val}\n")
-
-    def VEC_MUL(self, opsize, rd, rs1, rs2):
-        if not self.only_trace:
-            if isinstance(rd, list) and isinstance(rs1, list) and isinstance(rs2, list):
-                for i in range(opsize):
-                    self.shared_buffer.registers[rd[i]] = self.shared_buffer.registers[rs1[i]] * self.shared_buffer.registers[rs2[i]]
-            else:
-                self.shared_buffer.registers[rd] = self.shared_buffer.registers[rs1] * self.shared_buffer.registers[rs2]
-            
-        if self.op_trace:
-            rs1_val = rs1[0] if isinstance(rs1, list) else rs1
-            rs2_val = rs2[0] if isinstance(rs2, list) else rs2
-            rd_val = rd[0] if isinstance(rd, list) else rd
-            self.file.write(f"PNM_VEC_MUL {opsize} {rd_val} {rs1_val} {rs2_val}\n")
-
-    def TOPK(self, opsize, k, rd, rs):
-        if not self.only_trace:
-            # Functional model of Top-K
-            # rs might be a list of registers containing the scores
-            if isinstance(rs, list):
-                combined = torch.cat([self.shared_buffer.registers[r] for r in rs])
-            else:
-                combined = self.shared_buffer.registers[rs]
-            
-            values, indices = torch.topk(combined, k)
-            
-            # Write results back to rd registers
-            # This is a simplified model
-            rd_reg = rd[0] if isinstance(rd, list) else rd
-            # Store values in rd, indices in rd+1 or similar
-            self.shared_buffer.registers[rd_reg][:k] = values
-            if rd_reg + 1 in self.shared_buffer.registers:
-                self.shared_buffer.registers[rd_reg + 1][:k] = indices.to(torch.bfloat16)
-
-        if self.op_trace:
-            rs_val = rs[0] if isinstance(rs, list) else rs
-            rd_val = rd[0] if isinstance(rd, list) else rd
-            self.file.write(f"PNM_TOPK {opsize} {k} {rd_val} {rs_val}\n")
 
     def RISCV(self, opsize, pc, rd, rs):
         """
@@ -149,7 +132,7 @@ class PNM:
                 "pc": pc,
                 "rd": rd_reg,
                 "rs": rs_reg,
-                "dim": int(self.dim),
+                "dim": int(self.dim) if pc == PC_RMSNORM_SCALE else 0,
                 "input": input_value,
                 "result": self.shared_buffer.registers[rd_reg].clone(),
             }
@@ -163,7 +146,7 @@ class PNM:
             self.file.write(f"PNM_RISCV {opsize} {hex(pc)} {rd_val} {rs_val}\n")
 
 class SharedBuffer:
-    def __init__(self, num_registers=256):
+    def __init__(self, num_registers=512):
         self.num_registers = num_registers
         # Model 256-bit registers (each holding 16 elements)
         self.registers = {i: torch.zeros(16, dtype=torch.bfloat16) for i in range(num_registers)}
